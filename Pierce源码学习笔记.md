@@ -35,6 +35,65 @@ hook(Member method, MethodHook callback, boolean canInitDeclaringClass)
 | 5. 交给 handler      | 386-387  | sHookHandler.handleHook(...)                                                                                                                                                  |
 | 6. 回调监听          | 389-392  | hookListener.afterHook，返回 Unhook                                                                                                                                           |
 
+### 二·附：initialize() 内部五步（Pierce.java:151-203）
+
+> 六步表里第 2 步 `ensureInitialized()` 首次调用会走进 `initialize()`，这里是"Java 装前流程"里最后一块没展开的细节，按代码顺序逐条看。
+
+```java
+private static void initialize() {
+    PierceFileLogUtils.init(PierceConfig.context);   // 152 初始化文件日志
+
+    if (PierceConfig.disableHooks) {                 // 158 ① 全局禁用开关
+        PierceLogUtils.alwaysLogI("initialize: no limit by disableHooks");
+        return;                                      // 160 直接返回，.so 都不加载
+    }
+
+    int sdkLevel = PierceConfig.sdkLevel;            // 163
+    if (sdkLevel < Build.VERSION_CODES.KITKAT) {     // 164 ② 版本下限校验
+        String message = "Unsupported android sdk level " + sdkLevel;
+        throw new RuntimeException(message);         // 167
+    }
+
+    String vmVersion = System.getProperty("java.vm.version");   // 170
+    if (vmVersion == null || !vmVersion.startsWith("2")) {      // 171 ③ 确认是 ART
+        throw new RuntimeException("Only supports ART runtime"); // 174
+    }
+
+    initGenerateDex(PierceConfig.context);           // 177 ④ 准备 dex 生成
+
+    hookMode = sdkLevel < Build.VERSION_CODES.O
+            ? HookMode.INLINE_WITHOUT_JIT : HookMode.REPLACEMENT;  // 179 ⑤ 定默认模式
+
+    try {
+        LibLoader libLoader = PierceConfig.libLoader;
+        if (libLoader != null) libLoader.loadLib();  // 184 加载 libpierce.so
+        PierceNative.init0(sdkLevel, ...);           // 186 扫描 ArtMethod 字段偏移
+        if (PierceConfig.useFastNative && sdkLevel >= LOLLIPOP) {
+            PierceNative.enableFastNative();         // 194 改 FastNative 减少 JNI 开销
+        }
+        disableJitInlineAfterInit();                 // 197 关闭 JIT 内联优化
+    } catch (Exception e) {
+        throw new RuntimeException("pierce init error", e);  // 201
+    }
+}
+```
+
+**五步的作用（按代码顺序）**：
+
+| 步 | 代码 | 做什么 | 为什么 |
+|----|------|--------|--------|
+| ① | 158-161 | `disableHooks` 全局开关，true 直接 return | 全局禁用时连 .so 都不加载，省开销 |
+| ② | 163-168 | `sdkLevel < KITKAT`（4.4）抛异常 | 4.4 之前是 Dalvik 虚拟机，没有 ArtMethod 结构，原理失效 |
+| ③ | 170-175 | `java.vm.version` 不以 "2" 开头抛异常 | ART 版本号以 "2" 开头（Dalvik 是 "1.x"），这是判断当前跑在哪个虚拟机的土办法 |
+| ④ | 177 | `initGenerateDex(context)` | 找 HandleCallWrapClass 里的 `handleCall` 方法 + 建 `pierce_gen_dex` 目录（第五课讲的 dex 生成前置准备） |
+| ⑤ | 179-197 | 定 hookMode + loadLib + init0 + 关 JIT 内联 | 定默认模式、加载 .so、init0 扫描偏移、关内联防 hook 被绕过 |
+
+**关键点**：
+
+- **②③ 是在"选虚拟机"**：Android 4.4~5.0 之间 ART 和 Dalvik 并存，所以既查 `sdkLevel`（4.4 分界）又查 `vmVersion`（"2" 开头才是 ART），双重确认跑在 ART 上。
+- **⑤ 的 hookMode 决策是全局一次性的**（179 行），和 `setHookMode` 里 AUTO 分支（Pierce.java:214-227）逻辑完全一致：`sdkLevel < O` 用 INLINE_WITHOUT_JIT（O 以下有 sharpening 优化，改入口不生效），`>= O` 用 REPLACEMENT（更稳）。
+- **init0（186 行）是 Java 踏入 C 的第一脚**：native 层在这里扫描 ArtMethod 结构、动态定位 `entry_point_from_compiled_code_`/`access_flags_` 等字段的偏移（第七课讲的 InitMembers）。没有这一步，后面 hook0 根本不知道字段在内存哪个位置。
+
 ### 三、handleHook → hookNewMethod（Pierce.java:46-66 / 395-462）
 
 默认 handler 在 `Pierce.java:46`。关键逻辑：
@@ -385,7 +444,7 @@ final int mode = hookMode;           // 全局 hook 模式，setHookMode 设的
 boolean isInlineHook = mode == HookMode.INLINE || mode == HookMode.INLINE_WITHOUT_JIT;
 ```
 
-作用：先定好"这次 hook 用内联还是入口替换"。`isInlineHook` 为 true 表示走内联（INLINE 或 INLINE_WITHOUT_JIT），false 表示走 REPLACEMENT（入口替换）。这个布尔值会一路传给最后的 `hook0`，决定 native 层是改 `entry_point_from_compiled_code_`（replacement）还是覆盖机器码（inline）。
+作用：先定好"这次 hook 用内联还是入口替换"。`isInlineHook` 为 true 表示走内联（INLINE 或 INLINE*WITHOUT_JIT），false 表示走 REPLACEMENT（入口替换）。这个布尔值会一路传给最后的 `hook0`，决定 native 层是改 `entry_point_from_compiled_code*`（replacement）还是覆盖机器码（inline）。
 
 **第 2 步：静态方法先触发类初始化（400-412）**
 
@@ -412,6 +471,7 @@ final boolean proxy = Proxy.isProxyClass(declaring); // 是不是动态代理类
 ```
 
 作用：`jni` 和 `proxy` 是两种"特殊方法"，它们**不能走内联 hook**（下面第 4 步会用到）。原因：
+
 - native 方法没有 Java 字节码、没有可覆盖的已编译机器码，只能改 `entry_point_from_jni_`（JNI 入口替换）。
 - 代理方法由 JVM 运行时动态生成，结构特殊，inline 覆盖机器码会出问题。
 
@@ -493,22 +553,24 @@ if (backup == null) {
 
 定义在 **Pierce.java:1136-1162**：
 
-| 模式 | 值 | 原理 | 现状 |
-|---|---|---|---|
-| AUTO | 0 | 按 Android 版本自动选 | 默认值 |
-| INLINE | 1 | 覆盖方法已编译机器码前几条指令为跳转 | 已废弃（手动 JIT 易崩溃） |
-| REPLACEMENT | 2 | 改 `entry_point_from_compiled_code_` 字段指向跳板 | Android 8+ 主路径 |
-| INLINE_WITHOUT_JIT | 3 | 内联 hook，方法没编译就回退 REPLACEMENT | Android 8 以下主路径 |
+| 模式               | 值  | 原理                                              | 现状                      |
+| ------------------ | --- | ------------------------------------------------- | ------------------------- |
+| AUTO               | 0   | 按 Android 版本自动选                             | 默认值                    |
+| INLINE             | 1   | 覆盖方法已编译机器码前几条指令为跳转              | 已废弃（手动 JIT 易崩溃） |
+| REPLACEMENT        | 2   | 改 `entry_point_from_compiled_code_` 字段指向跳板 | Android 8+ 主路径         |
+| INLINE_WITHOUT_JIT | 3   | 内联 hook，方法没编译就回退 REPLACEMENT           | Android 8 以下主路径      |
 
 "REPLACEMENT = 改变 entry point 指针入口" 理解正确，但有个必须抠细的点：改 `entry_point_from_compiled_code_`，改成的**不是直接 bridge 的入口，而是 trampoline（跳板）的地址**。跳板是一段纯汇编，负责摆好寄存器/调用约定后再跳 bridge。中间多一层跳板是因为 ART 调用方法时有固定寄存器约定（this 在哪个寄存器、参数怎么排），直接指 bridge 会破坏约定。
 
 AUTO 的决策在 `setHookMode`（Pierce.java:203-211）：
+
 ```java
 newHookMode = sdkLevel < O ? INLINE_WITHOUT_JIT : REPLACEMENT;
 ```
+
 原因（Pierce.java:204-207 注释）：Android N 及以下 `entry_point_from_compiled_code_` 可能被硬编码进机器码（sharpening），改字段无效，用 inline；O+ 不做此优化，用更稳的 REPLACEMENT。
 
-### 问2：art::Thread* 详解，和 ArtMethod 有关联吗？
+### 问2：art::Thread\* 详解，和 ArtMethod 有关联吗？
 
 **无字段级别关联**：ArtMethod 是"方法"结构体（一个方法一个），art::Thread 是"线程"结构体（一个线程一个）。两者是 ART 两个不同维度的核心对象。但在 hook 里紧密配合：Thread 是"执行者身份凭据"（挂起 VM、JIT 编译都要它），ArtMethod 是"被修改目标"。
 
@@ -517,11 +579,11 @@ newHookMode = sdkLevel < O ? INLINE_WITHOUT_JIT : REPLACEMENT;
 **怎么拿到当前线程**：`currentArtThread0`（pine.cpp:441-442）一行 `reinterpret_cast<jlong>(art::Thread::Current(env))`。真正逻辑在 `Thread::Current`（thread.h:31-59），4 种方式按优先级降级：
 
 1. **直接调 ART 符号**（thread.h:33-34）：`current()` = `CurrentFromGdb()`，在 Thread::Init（thread.cpp:24-25）从 libart.so 按符号解析。
-2. **Java 反射读 nativePeer 字段**（thread.h:35-48）：`Thread.currentThread()` 拿对象，再 GetLongField 读 nativePeer（ART 把 art::Thread* 藏在这个字段）。
+2. **Java 反射读 nativePeer 字段**（thread.h:35-48）：`Thread.currentThread()` 拿对象，再 GetLongField 读 nativePeer（ART 把 art::Thread\* 藏在这个字段）。
 3. **读 TLS 槽位 7**（thread.h:49-50）：`__get_tls()[7]`（TLS_SLOT_ART_THREAD_SELF）。`__get_tls` 是内联汇编（thread.h:16-24）读 arm64 的 TLS 基址寄存器 `tpidr_el0`，再取第 7 槽。
 4. **pthread key**（thread.h:51-52）：`pthread_getspecific(*key_self)`，最老版本兜底。
 
-方式③的汇编是 OS 原理重点：`tpidr_el0` 是 arm64 的线程指针寄存器，CPU 用它指向当前线程 TLS 块；ART 把 art::Thread* 存在该块固定槽位 7，一条 `mrs` 指令读完，最快路径。
+方式③的汇编是 OS 原理重点：`tpidr_el0` 是 arm64 的线程指针寄存器，CPU 用它指向当前线程 TLS 块；ART 把 art::Thread\* 存在该块固定槽位 7，一条 `mrs` 指令读完，最快路径。
 
 ### 问3：bridge / backup 举例说明
 
@@ -535,6 +597,7 @@ newHookMode = sdkLevel < O ? INLINE_WITHOUT_JIT : REPLACEMENT;
 - **backup（原方法替身）**：body = 原 add 的字节码 `return a + b;`，保留原逻辑。
 
 **hook 后完整链路**：
+
 ```
 calculator.add(1,2)
   → entry_point 改成 trampoline
@@ -709,16 +772,17 @@ hookRecord.backup = backupMethod;
 
 dex 格式的「短签名」，单字母描述返回值+每个参数类型。computeShorty（601-614）+ toShorty（588-599）算出：
 
-| 字母 | 类型 | | 字母 | 类型 |
-|---|---|---|---|---|
-| V | void | | J | long |
-| Z | boolean | | F | float |
-| B | byte | | D | double |
-| C | char | | L | 所有引用类型 |
-| S | short | | | |
-| I | int | | | |
+| 字母 | 类型    |     | 字母 | 类型         |
+| ---- | ------- | --- | ---- | ------------ |
+| V    | void    |     | J    | long         |
+| Z    | boolean |     | F    | float        |
+| B    | byte    |     | D    | double       |
+| C    | char    |     | L    | 所有引用类型 |
+| S    | short   |     |      |              |
+| I    | int     |     |      |              |
 
 举例（类比 JNI 签名精简版）：
+
 - `int add(int a, int b)` → `III`
 - `void log(String tag, String msg)` → `VLL`
 - `String getName()` → `LL`
@@ -747,12 +811,12 @@ HookRecord hookRecord = sHookRecords.get((long) artTargetMethod);
 
 genereateDexAndLoad 不是"只为创建 bridge/backup"，完整职责是"准备材料"：生成（bridge + backup + artTargetMethod 字段）+ 加载（让它们活起来）+ 注入（写 ArtMethod 地址）+ 找回（反射取回）。
 
-| 比喻 | 实际 |
-|---|---|
-| 躯体 | 磁盘上的 `.dex` 文件（innerGenerateDexFile 写出的字节流） |
-| 灵魂 | 加载后每个方法拥有的 `ArtMethod` 结构体（真正的"方法实体"） |
-| 完整的人 | bridge/backup 成为能独立存在、可被 ART 调用的方法 |
-| 交给 hook0 | 把这两个"活方法"的 ArtMethod 指针交出去改入口 |
+| 比喻       | 实际                                                        |
+| ---------- | ----------------------------------------------------------- |
+| 躯体       | 磁盘上的 `.dex` 文件（innerGenerateDexFile 写出的字节流）   |
+| 灵魂       | 加载后每个方法拥有的 `ArtMethod` 结构体（真正的"方法实体"） |
+| 完整的人   | bridge/backup 成为能独立存在、可被 ART 调用的方法           |
+| 交给 hook0 | 把这两个"活方法"的 ArtMethod 指针交出去改入口               |
 
 顺序：`innerGenerateDexFile`（躯体）→ `DexClassLoader` + `loadClass`（ART 解析 dex，分配 ArtMethod，赋予灵魂）→ 反射取回 → 交给 hook0。
 
@@ -760,14 +824,14 @@ genereateDexAndLoad 不是"只为创建 bridge/backup"，完整职责是"准备�
 
 以下 native/底层方法在讲解时暂时略过，全部讲完主线后回归：
 
-| 方法 | Java 位置 | native 实现 | 评估 | 原因 |
-|---|---|---|---|---|
-| `generateDex` | PierceNative.java | pine.cpp:516 → DexBuilderUtil.cpp:12 | **必须详细讲** | 运行时生成 dex 是 Pierce 核心，涉及 dex 字节码格式 + slicer 库 |
-| `compile0` | PierceNative.java | pine.cpp（Pine_compile0） | **需要讲** | 与 inline hook 直接相关，涉及 ART JIT 机制 |
-| `hook0` | PierceNative.java | pine.cpp:186（Pine_hook0） | **已讲（第六课）** | 改入口的核心 |
-| `handleCall` | Pierce.java:1009 | 无（纯 Java） | **必须详细讲** | 回调分发核心（before→原方法→after） |
-| `resolve()` | Pierce.java:678 | 无（纯 Java） | 简要讲 | Java 反射技巧，逻辑简单（故意错误参数触发类初始化） |
-| `makeClassesVisiblyInitialized` | PierceNative.java | pine.cpp（native） | 简要讲 | 涉及 ART 内部类状态，工程面窄，知道作用即可 |
+| 方法                            | Java 位置         | native 实现                          | 评估               | 原因                                                           |
+| ------------------------------- | ----------------- | ------------------------------------ | ------------------ | -------------------------------------------------------------- |
+| `generateDex`                   | PierceNative.java | pine.cpp:516 → DexBuilderUtil.cpp:12 | **必须详细讲**     | 运行时生成 dex 是 Pierce 核心，涉及 dex 字节码格式 + slicer 库 |
+| `compile0`                      | PierceNative.java | pine.cpp（Pine_compile0）            | **需要讲**         | 与 inline hook 直接相关，涉及 ART JIT 机制                     |
+| `hook0`                         | PierceNative.java | pine.cpp:186（Pine_hook0）           | **已讲（第六课）** | 改入口的核心                                                   |
+| `handleCall`                    | Pierce.java:1009  | 无（纯 Java）                        | **必须详细讲**     | 回调分发核心（before→原方法→after）                            |
+| `resolve()`                     | Pierce.java:678   | 无（纯 Java）                        | 简要讲             | Java 反射技巧，逻辑简单（故意错误参数触发类初始化）            |
+| `makeClassesVisiblyInitialized` | PierceNative.java | pine.cpp（native）                   | 简要讲             | 涉及 ART 内部类状态，工程面窄，知道作用即可                    |
 
 ---
 
@@ -775,12 +839,12 @@ genereateDexAndLoad 不是"只为创建 bridge/backup"，完整职责是"准备�
 
 ### 一、定位
 
-| 层 | 位置 | 说明 |
-|---|---|---|
-| Java 调用点 | Pierce.java:449 | `PierceNative.hook0(...)` |
-| Java 声明 | PierceNative.java | `native Method hook0(...)`，只有签名 |
-| C++ 实现 | **pine.cpp:186-302** | `Pine_hook0`，本课主角 |
-| 关键调用实现 | trampoline_installer.cpp:165 / art_method.cpp:250 / art_method.cpp:310 | 装跳板 / BackupFrom / AfterHook |
+| 层           | 位置                                                                   | 说明                                 |
+| ------------ | ---------------------------------------------------------------------- | ------------------------------------ |
+| Java 调用点  | Pierce.java:449                                                        | `PierceNative.hook0(...)`            |
+| Java 声明    | PierceNative.java                                                      | `native Method hook0(...)`，只有签名 |
+| C++ 实现     | **pine.cpp:186-302**                                                   | `Pine_hook0`，本课主角               |
+| 关键调用实现 | trampoline_installer.cpp:168 / art_method.cpp:346 / art_method.cpp:448 | 装跳板 / BackupFrom / AfterHook      |
 
 ### 二、为什么要有 hook0（先答"为什么"）
 
@@ -820,7 +884,7 @@ jobject Pine_hook0(JNIEnv *env, jclass,
     bool is_inline_hook = JBOOL_TRUE(isInlineHook);
     const bool is_native = JBOOL_TRUE(isJni);
     const bool is_proxy  = JBOOL_TRUE(isProxy);
-    const bool is_native_or_proxy = is_native || is_proxy;
+    // 注：当前分支已移除 is_native_or_proxy 合并变量，AfterHook/BackupFrom 直接传 is_native、is_proxy 两个分开的参数
 
     TrampolineInstaller *trampoline_installer = TrampolineInstaller::GetDefault();
 
@@ -851,7 +915,7 @@ jobject Pine_hook0(JNIEnv *env, jclass,
             // ⑨ ★ backup 复制 target 状态，成为"原方法替身"
             backup->BackupFrom(target, call_origin, is_inline_hook, is_native, is_proxy);
             // ⑩ ★ 改 target 的 access_flags，防 JIT/内联干扰
-            target->AfterHook(is_inline_hook, is_native_or_proxy);
+            target->AfterHook(is_inline_hook, is_native, is_proxy);
             new_entrypoint = target->GetEntryPointFromCompiledCode();
         } else {
             // 失败：拼错误信息
@@ -936,7 +1000,7 @@ void *TrampolineInstaller::InstallReplacementTrampoline(art::ArtMethod *target, 
 backup->BackupFrom(target, call_origin, is_inline_hook, is_native, is_proxy);
 ```
 
-实现在 art_method.cpp:250-308。**作用：把 target 完整状态复制到 backup，让 backup 能独立执行原逻辑。** 关键：
+实现在 art_method.cpp:346-446。**作用：把 target 完整状态复制到 backup，让 backup 能独立执行原逻辑。** 关键：
 
 ```cpp
 void ArtMethod::BackupFrom(ArtMethod* source, void* entry, ...) {
@@ -960,7 +1024,7 @@ void ArtMethod::BackupFrom(ArtMethod* source, void* entry, ...) {
     access_flags &= ~AccessFlags::kConstructor;
     SetAccessFlags(access_flags);
 
-    // ③ 处理 JIT 信息（防 GC 回收崩溃）—— 略
+    // ③ 处理 JIT 信息（防 GC 回收崩溃）—— 详见第十课第四节"JIT 信息迁移"
 
     // ④ 设 backup 自己的入口
     SetEntryPointFromCompiledCode(entry);   // entry = call_origin（原方法入口）
@@ -981,13 +1045,13 @@ void ArtMethod::BackupFrom(ArtMethod* source, void* entry, ...) {
 #### 步骤 ⑩：AfterHook —— 防止 hook 被 ART 干扰（271）
 
 ```cpp
-target->AfterHook(is_inline_hook, is_native_or_proxy);
+target->AfterHook(is_inline_hook, is_native, is_proxy);
 ```
 
-实现在 art_method.cpp:310-354。**作用：改 target 的 access_flags，防止 JIT/内联/解释器把 hook 绕过或还原。** 关键：
+实现在 art_method.cpp:448-519。**作用：改 target 的 access_flags，防止 JIT/内联/解释器把 hook 绕过或还原。** 关键：
 
 ```cpp
-void ArtMethod::AfterHook(bool is_inline_hook, bool is_native_or_proxy) {
+void ArtMethod::AfterHook(bool is_inline_hook, bool is_native, bool is_proxy) {
     uint32_t access_flags = GetAccessFlags();
 
     // ≥N：禁止被 JIT 再编译
@@ -997,13 +1061,19 @@ void ArtMethod::AfterHook(bool is_inline_hook, bool is_native_or_proxy) {
     }
     // ≥O 且非 inline：debug 模式强制解释器会忽略 entry_point，设 kNative 避免
     if (Android::version >= Android::kO && !is_inline_hook) {
-        if (PineConfig::debuggable && !is_native_or_proxy) {
+        if (PineConfig::debuggable && !(is_native || is_proxy)) {
             access_flags |= AccessFlags::kNative;
         }
     }
     // ≥Q：清除 fast interpreter 缓存标志，刷新状态
     if (Android::version >= Android::kQ) {
         access_flags &= ~AccessFlags::kFastInterpreterToInterpreterInvoke;
+    }
+    // FastNative/CriticalNative 执行时 GC 被禁用，可能死锁，hook 方法不能带这两个标志（当前分支新增）
+    bool hasNativeFlags = (access_flags & AccessFlags::kNative) != 0;
+    if (hasNativeFlags) {
+        access_flags &= ~AccessFlags::kFastNative;
+        if (Android::version >= Android::kP) access_flags &= ~AccessFlags::kCriticalNative;
     }
     SetAccessFlags(access_flags);
     // 设解释器入口为 interpreter→compiled bridge
@@ -1040,6 +1110,7 @@ hook 后：
 ```
 
 三句话记住分工：
+
 1. **target**：入口被改，成为"被 hook 的方法"，所有调用被截走。
 2. **bridge**：新入口（经跳板），接住调用、转 handleCall 分发回调。
 3. **backup**：BackupFrom 复制了 target 状态 + 入口指向原机器码，成为"原方法替身"。
@@ -1069,11 +1140,11 @@ hook 后：
 
 **手术完成后完整状态**：
 
-| 角色 | 是什么 | entry_point 指向 | 谁调它 |
-|---|---|---|---|
-| target | 你 hook 的原方法 | 跳板（被改掉） | 业务代码照常调 add |
-| bridge | 新入口（拦截） | 自己的 body | 跳板拐进来的 |
-| backup | 原方法替身 | 机器码A（原逻辑） | bridge 的 handleCall 里调 |
+| 角色   | 是什么           | entry_point 指向  | 谁调它                    |
+| ------ | ---------------- | ----------------- | ------------------------- |
+| target | 你 hook 的原方法 | 跳板（被改掉）    | 业务代码照常调 add        |
+| bridge | 新入口（拦截）   | 自己的 body       | 跳板拐进来的              |
+| backup | 原方法替身       | 机器码A（原逻辑） | bridge 的 handleCall 里调 |
 
 **真实调用走查 `calculator.add(1,2)`**：
 
@@ -1123,13 +1194,13 @@ if (!callFrame.returnEarly) {
 
 **区别**：
 
-| 维度 | MethodHook.beforeCall | MethodReplacement.replaceCall |
-|---|---|---|
-| 原方法执行 | 默认执行（除非手动 setResult） | 必然不执行 |
-| 定位 | 织入（前后插逻辑） | 整体替换（顶掉原方法） |
-| 实现 | 你自己写 | final 的 beforeCall 内部调 replaceCall + setResult |
-| 返回值作用 | 你设了才生效 | 返回值就是方法最终返回值 |
-| 用途 | 记录参数、改参数、统计 | 完全改掉方法行为（DO_NOTHING、returnConstant） |
+| 维度       | MethodHook.beforeCall          | MethodReplacement.replaceCall                      |
+| ---------- | ------------------------------ | -------------------------------------------------- |
+| 原方法执行 | 默认执行（除非手动 setResult） | 必然不执行                                         |
+| 定位       | 织入（前后插逻辑）             | 整体替换（顶掉原方法）                             |
+| 实现       | 你自己写                       | final 的 beforeCall 内部调 replaceCall + setResult |
+| 返回值作用 | 你设了才生效                   | 返回值就是方法最终返回值                           |
+| 用途       | 记录参数、改参数、统计         | 完全改掉方法行为（DO_NOTHING、returnConstant）     |
 
 MethodReplacement（MethodReplacement.java:36-45）故意把 beforeCall 设为 final、afterCall 空实现，逼你只用 replaceCall：
 
@@ -1191,11 +1262,11 @@ FUNCTION(pine_method_jump_trampoline)
 
 整个 REPLACEMENT 跳板就这 3 条指令：
 
-| 指令 | 作用 | 为什么 |
-|---|---|---|
+| 指令                    | 作用                            | 为什么                                        |
+| ----------------------- | ------------------------------- | --------------------------------------------- |
 | `ldr x0, [dest_method]` | bridge 的 ArtMethod 指针放进 x0 | ARM64 调用约定：x0 必须是被调方法的 ArtMethod |
-| `ldr x17, [dest_entry]` | bridge 入口地址放进 x17 | x17 是临时寄存器，暂存跳转目标 |
-| `br x17` | 跳转到 bridge 入口 | 真正"拐进去" |
+| `ldr x17, [dest_entry]` | bridge 入口地址放进 x17         | x17 是临时寄存器，暂存跳转目标                |
+| `br x17`                | 跳转到 bridge 入口              | 真正"拐进去"                                  |
 
 `CreateMethodJumpTrampoline` 干的事：把汇编模板拷贝到可执行内存，再填两个数据槽（bridge 指针 + bridge 入口），最后 `Memory::FlushCache` 刷新指令缓存：
 
@@ -1214,16 +1285,16 @@ void* TrampolineInstaller::CreateMethodJumpTrampoline(art::ArtMethod* dest) {
 
 **hook0 是"编排者"，不是"演奏者"。** 它 11 步、200 行，是完整 hook 逻辑的执行入口，但每一句调用背后都藏着没展开的实现：
 
-| hook0 里的调用 | 背后藏着的"重活" | 藏在哪个文件 |
-|---|---|---|
-| `FromReflectedMethod` | offset 动态扫描 + R 版本反射适配 | art_method.cpp:99 / InitMembers |
-| `SetEntryPointFromCompiledCode` | Member 的 offset 适配 | art_method.h:150 → member.h |
-| `CreateMethodJumpTrampoline` | 汇编跳板模板 | arm64.S:46-55 |
-| `ScopedSuspendVM` | suspend/resume 符号解析 + stop-the-world | android.h / android.cpp |
-| `BackupFrom` | CopyFrom 符号 + memcpy 整个结构 | art_method.cpp:250 |
-| `AfterHook` | 一堆 access_flags 版本适配 | art_method.cpp:310 |
-| `Memory::AllocUnprotected` | 分配可执行内存（mmap 权限） | memory.cpp |
-| `Memory::FlushCache` | 刷新 CPU 指令缓存（OS 原理） | memory.cpp |
+| hook0 里的调用                  | 背后藏着的"重活"                         | 藏在哪个文件                    |
+| ------------------------------- | ---------------------------------------- | ------------------------------- |
+| `FromReflectedMethod`           | offset 动态扫描 + R 版本反射适配         | art_method.cpp:99 / InitMembers |
+| `SetEntryPointFromCompiledCode` | Member 的 offset 适配                    | art_method.h:150 → member.h     |
+| `CreateMethodJumpTrampoline`    | 汇编跳板模板                             | arm64.S:46-55                   |
+| `ScopedSuspendVM`               | suspend/resume 符号解析 + stop-the-world | android.h / android.cpp         |
+| `BackupFrom`                    | CopyFrom 符号 + memcpy 整个结构          | art_method.cpp:250              |
+| `AfterHook`                     | 一堆 access_flags 版本适配               | art_method.cpp:310              |
+| `Memory::AllocUnprotected`      | 分配可执行内存（mmap 权限）              | memory.cpp                      |
+| `Memory::FlushCache`            | 刷新 CPU 指令缓存（OS 原理）             | memory.cpp                      |
 
 所以"很多东西没体现"的感觉是对的：hook0 这 200 行是"调度清单"，真正工程量散落在 art_method.cpp、trampoline_installer.cpp、arm64.S、android.cpp 里，加起来上千行。
 
@@ -1235,13 +1306,1007 @@ void* TrampolineInstaller::CreateMethodJumpTrampoline(art::ArtMethod* dest) {
 
 之前感觉"没看到汇编/OS"，其实一直在，分布在三处：
 
-| 目录 | 对应知识 |
-|---|---|
-| `trampoline/arch/*.S`（arm64.S / arm32.S / thumb2.S） | 手写汇编跳板（机器码肉身） |
-| `utils/memory.cpp` / `elf_image.cpp` / `memutil.h` | OS 原理：mprotect 改页权限、ELF 解析、内存对齐、FlushCache 刷指令缓存 |
-| `art/` | ART 内部：改哪个字段、挂起哪个 VM、TLS 拿线程 |
-| `utils/scoped_memory_access_protection.*` | 临时改代码页只读→可写的 RAII |
+| 目录                                                  | 对应知识                                                              |
+| ----------------------------------------------------- | --------------------------------------------------------------------- |
+| `trampoline/arch/*.S`（arm64.S / arm32.S / thumb2.S） | 手写汇编跳板（机器码肉身）                                            |
+| `utils/memory.cpp` / `elf_image.cpp` / `memutil.h`    | OS 原理：mprotect 改页权限、ELF 解析、内存对齐、FlushCache 刷指令缓存 |
+| `art/`                                                | ART 内部：改哪个字段、挂起哪个 VM、TLS 拿线程                         |
+| `utils/scoped_memory_access_protection.*`             | 临时改代码页只读→可写的 RAII                                          |
 
 三者关系一句话：汇编（.S）= 跳板机器码肉身；OS 原理（memory/elf）= 让跳板能写进内存、能被找到、能被 CPU 执行；ART 内部（art/）= 告诉改哪个字段、挂起哪个 VM。
+
+---
+
+## 第七课：从 hook() 逐行深入 —— 初始化与偏移扫描（C 核心）
+
+> 本课开始，不再只讲骨架，而是从 `hook()` 方法（Pierce.java:342）逐行深入，遇到 C/汇编/OS 知识停下来单独讲透。Java 只讲核心点，重点深入 C。
+
+### 一、hook() 方法签名（Java 简略，只讲核心点）
+
+```java
+public static MethodHook.Unhook hook(Member method, MethodHook callback, boolean canInitDeclaringClass)
+```
+
+核心点（一句话）：`Member` 是 `Method`/`Constructor`/`Field` 的公共接口，用它能同时 hook 方法和构造器；`Unhook` 返回值是"撤销句柄"，调 `unhook()` 能解除这次 hook（类比 `registerReceiver` 返回注销句柄）。
+
+方法体校验段（344-362）排除的是"ART 里没有机器码可改"的方法：抽象方法无方法体、`<clinit>` 静态构造器不是普通方法。
+
+### 二、ensureInitialized → init0（Java → C 的分界）
+
+`ensureInitialized()`（364 行）双检锁，首次调 `initialize()` → `PierceNative.init0(...)`（Pierce.java:174）。**init0 就是 Java 踏入 C 的第一脚。**
+
+### 三、C 核心：NativeMark 是什么（疑问的根）
+
+**NativeMark.java:8**：
+
+```java
+/**
+ * Internal ruler used for calculating ArtMethod size and members offset.
+ */
+final class NativeMark {
+    private static native void m1(float f);   // 两个 native 方法
+    private static native void m2();
+    private interface I { void m(); }
+}
+```
+
+**关键认知链**：
+
+1. `m1`、`m2` 是两个 **native 方法**（Java 侧只有 `native` 声明，无方法体）。
+2. ART 运行时，**每个 Java 方法（不管是否 native）在内存里都有一个 `ArtMethod` 结构体**。
+3. 同一类的所有方法 ArtMethod 在内存里**连续排列**，所以 m1、m2 背后各有一个 ArtMethod 结构体，地址相减 = 单个 ArtMethod 结构体大小。
+
+**"Ruler"** 是 `NativeMark` 类在 C++ 里的引用名（jni_bridge.cpp:34），作者把这个类叫"标尺/尺子"，专门量 ArtMethod 大小和偏移。
+
+### 四、JNI 注册机制（为什么 m1 注册、m2 不注册）
+
+#### native 方法的调用链
+
+```
+调用 m1()
+  → ART 读 m1.entry_point_from_compiled_code_（native 方法指向 generic jni trampoline 公共桩）
+  → 桩读 m1.entry_point_from_jni_（真正的 C 函数地址）
+  → 跳转到 C 函数执行
+```
+
+所以 **`entry_point_from_jni_` = "native 方法的 C 实现地址"**。
+
+#### 两种注册方式
+
+**A. 静态注册**：函数名 `Java_包名_类名_方法名`，ART 用 dlsym 按符号名找。慢、名字长易错。
+
+**B. 动态注册（RegisterNatives，本工程用）**：
+
+```cpp
+// ruler.cpp:13-19
+static const JNINativeMethod gMethods[] = {
+    {m1(), "(F)V", reinterpret_cast<void*>(Ruler_m1)}   // 显式绑定 m1 → Ruler_m1
+};
+bool register_Ruler(JNIEnv* env, jclass Ruler) {
+    return env->RegisterNatives(Ruler, gMethods, 1) == JNI_OK;
+}
+```
+
+`RegisterNatives` 把 Ruler*m1 地址写进 m1 的 `entry_point_from_jni*` 字段。
+
+#### 为什么"获取 ArtMethod"还要注册
+
+注册不是为了获取结构体，而是**往 m1 的 entry*point_from_jni* 字段"埋一个已知标记值（Ruler_m1 地址）"**，扫描时靠这个标记定位字段位置。
+
+#### 为什么 m2 不注册
+
+m2 只干一件事：提供第二个 ArtMethod 地址，和 m1 相减算 size。它从不参与扫描字段值，所以 entry*point_from_jni* 指向谁不重要，只需"存在一个结构体、有个地址"。
+
+**一句话**：m1 是"带标记的尺子刻度"（要注册埋标记），m2 是"尺子另一端"（只要位置）。
+
+### 五、Ruler_m1 地址为什么"编译时确定"
+
+1. 编译：C 代码 → 机器码 → 放进 .so 的 `.text` 段。
+2. 符号表：`Ruler_m1` 符号 → .text 段的相对位置。
+3. 加载重定位：loadLibrary 时，动态链接器把 .so 映射进内存，相对地址 + 基址 = 真实地址。
+4. C 里"函数名单独出现"就代表函数地址。
+
+所以 Ruler_m1 是我们自己的函数，运行时地址稳定、可预测、已知。对比 `art_quick_to_interpreter_bridge` 是 libart.so 的符号，编译时不知道，得用 ELF 解析查。
+
+### 六、InitMembers 逐行（art_method.cpp:128-158）—— 本课核心
+
+```cpp
+void ArtMethod::InitMembers(JNIEnv *env, ArtMethod *m1, ArtMethod *m2, ArtMethod *m3, uint32_t access_flags) {
+    // ① 按版本初始化 access flag 常量值
+    if (Android::version >= Android::kN) {
+        kAccCompileDontBother = (Android::version >= Android::kOMr1)
+                                ? AccessFlags::kCompileDontBother_O_MR1
+                                : AccessFlags::kCompileDontBother_N;
+    }
+    // ② 算结构体大小：两个相邻方法地址相减
+    size = Difference(reinterpret_cast<intptr_t>(m1), reinterpret_cast<intptr_t>(m2));
+    // ③ declaring_class 偏移（M+ 是 0，更老版本是 sizeof(void*)）
+    declaring_class.SetOffset(android_version >= Android::kM ? 0 : sizeof(void *));
+    // ④ 探测 access_flags_ 偏移
+    InitMemberAccessFlags(m1, access_flags);
+    // ⑤ 探测 entry_point 系列偏移
+    InitMemberEntryPoint(m1);
+}
+```
+
+#### 行②：Difference（art_method.cpp:122）
+
+```cpp
+static inline size_t Difference(intptr_t a, intptr_t b) {
+    intptr_t size = b - a;
+    if (size < 0) size = -size;   // 取绝对值
+    return size;
+}
+```
+
+`reinterpret_cast<intptr_t>(m1)` 把指针强行解释成整数（`intptr_t` 是"足够存指针"的整数类型）。转整数后相减得纯字节差。
+
+### 七、偏移扫描底层：FindOffset + safeReadValue（memory.h:30-49）
+
+```cpp
+template<typename T>
+static int FindOffset(void *start, T value, size_t size, uint step) {
+    for (uint32_t offset = 0; offset < size; offset += step) {
+        T currentValue = safeReadValue<T>(start, offset);
+        if (currentValue == value) return offset;   // 相等 → 字段偏移
+    }
+    return -1;
+}
+
+template<typename T>
+static T safeReadValue(const void *start, uint32_t offset) {
+    T value;
+    memcpy(&value, (void*)((uintptr_t)start + offset), sizeof(T));
+    return value;
+}
+```
+
+`safeReadValue` 逐字：
+
+1. `(uintptr_t)start + offset`：起始指针转整数 + 偏移 = 目标字段绝对地址。
+2. `(void*)...`：整数转回指针。
+3. `memcpy(&value, 源地址, sizeof(T))`：从源地址拷贝 sizeof(T) 字节。
+4. 返回 value。
+
+**偏移扫描 = 暴力枚举 + 已知值比对，没有魔法。**
+
+### 八、探测 access*flags*（InitMemberAccessFlags，art_method.cpp:160-199）
+
+思路：已知 m1 的 access*flags 值（Java 反射 getAccessFlags 拿到），扫描找"哪个位置的值 == 已知值"，就是 access_flags* 偏移。步长 2 因为字段通常 2 字节对齐。
+
+### 九、探测 entry_point（InitMemberEntryPoint，art_method.cpp:201-251）
+
+```cpp
+// ① 扫 entry_point_from_jni_：找值 == Ruler_m1 的位置
+for (uint32_t offset = 0; offset < size; offset += 2) {
+    if (Memory::safeReadValue<void*>(m1, offset) == Ruler_m1) {
+        entry_point_from_jni_.SetOffset(offset);
+        break;
+    }
+}
+// ② compiled_code = jni + 一个指针大小（O+ 要 AlignUp 对齐）
+uint32_t compiled_code_entry_offset = entry_point_from_jni_.GetOffset() + entry_point_member_size;
+if (Android::version >= Android::kO) {
+    compiled_code_entry_offset = Memory::AlignUp(compiled_code_entry_offset, entry_point_member_size);
+}
+entry_point_from_compiled_code_.SetOffset(compiled_code_entry_offset);
+```
+
+entry*point_from_compiled_code* 不用单独扫，因为它紧跟 entry*point_from_jni* 后面（ART 布局相邻），+sizeof(void\*) 即可（O+ 要对齐，因为 PACKED(8) 可能有 padding）。
+
+### 十、答疑（七个问题）
+
+#### 问1+2：为什么 m2 不注册？为什么获取 ArtMethod 要注册？
+
+见本课"四"节。m1 注册是为了埋已知标记 Ruler_m1 供扫描；m2 只提供地址算 size，不需注册。
+
+#### 问3：Ruler_m1 地址为什么编译时确定？
+
+见本课"五"节。
+
+#### 问4：位标志 bit flags 详解
+
+**核心思想**：一个 32 位整数存 32 个独立"是/否"开关，每一位（bit）代表一个属性。
+
+| 位号 | 数值   | 含义（例） |
+| ---- | ------ | ---------- |
+| 0    | 1 = 2⁰ | public     |
+| 1    | 2      | private    |
+| 2    | 4      | protected  |
+| 3    | 8      | static     |
+| 4    | 16     | final      |
+| 5    | 32     | native     |
+
+举例："public static native" = 1 + 8 + 32 = 41 = 二进制 `00101001`。
+
+三个操作：
+
+- **设置**：`flags | 16`（按位或，任一为1结果1）
+- **清除**：`flags & ~1`（取反 + 按位与）
+- **检查**：`flags & 8`（非0说明该位是1）
+
+为什么用位标志：省空间（1个int vs 32个boolean）、快（一条位运算指令）。
+
+#### 问5：ArtMethod 字段布局固定吗？declaring_class 一定是第一个吗？
+
+不固定，随 Android 版本变（字段增删、顺序调整、类型变化）。这是动态适配的根本原因。
+
+declaring_class 不是恒定第一个：M+ 偏移 0，M- 偏移 sizeof(void\*)。所以不扫描而写死，因为规则简单（两种情况）。access_flags/entry_point 规则复杂，才扫描。
+
+#### 问6：两种类型强转
+
+```cpp
+reinterpret_cast<intptr_t>(m1)   // C++ 风格
+(uintptr_t)start                  // C 风格
+```
+
+功能一样：把指针值重新解释成整数。`reinterpret_cast` 是 C++ 明确的位重解释运算符；`(uintptr_t)` 是 C 遗留简洁写法。转整数是因为 C++ 指针不能直接相减得字节数。
+
+#### 问7：内存对齐 alignment
+
+**每种类型有对齐要求：起始地址必须是其大小的整数倍。**
+
+| 类型       | 大小 | 对齐 |
+| ---------- | ---- | ---- |
+| char       | 1    | 1    |
+| short      | 2    | 2    |
+| int        | 4    | 4    |
+| 指针(64位) | 8    | 8    |
+
+原因：CPU 按固定块读内存，不对齐要读两次拼接（慢），某些 CPU 直接抛异常（崩）。
+
+**struct padding**：
+
+```c
+struct S { char a; int b; };
+// 实际布局：char a(偏移0) + 3字节padding + int b(偏移4)，sizeof=8（不是5）
+```
+
+因为 b 需要 4 字节对齐，不能放偏移 1，编译器插 3 字节 padding。
+
+**对应工程**：Android O+ ArtMethod 指针字段组 PACKED(8)，jni 和 compiled_code 之间可能有 padding，所以 `AlignUp`：
+
+```cpp
+template <typename T>
+static inline T AlignUp(T value, T align_with) {
+    T alignment = value % align_with;
+    if (alignment) value += (align_with - alignment);
+    return value;
+}
+```
+
+**为什么 safeReadValue 用 memcpy 不直接解引用**：扫描步长 2，读 8 字节指针时地址可能落在 2、6、10 这种不对齐位置，直接 `*(T*)` 会未对齐访问崩溃；memcpy 按字节拷贝，安全无视对齐。
+
+### 十一、C 知识清单（本课掌握）
+
+| #   | 知识点                        | 一句话                                          |
+| --- | ----------------------------- | ----------------------------------------------- |
+| 1   | 指针 = 地址 = 整数            | m1 的值就是内存地址                             |
+| 2   | native 方法 + RegisterNatives | Java 声明 native，C 侧 RegisterNatives 绑定实现 |
+| 3   | JNI_OnLoad                    | .so 加载时 ART 自动调用，完成注册               |
+| 4   | struct 连续布局 + 偏移        | 偏移 = 字段离结构体起始的字节距离               |
+| 5   | 起始地址 ≠ 偏移               | 起始地址是楼地址，偏移是房间号                  |
+| 6   | memcpy 字节拷贝               | 从任意地址安全读数据，避对齐/可读性坑           |
+| 7   | 内存对齐 + AlignUp            | O+ 字段有 padding，要向上对齐                   |
+| 8   | 位标志 bit flags              | access_flags 用 32 位整数每个 bit 表示一个属性  |
+| 9   | reinterpret_cast / intptr_t   | 指针↔整数互转，算字节差                         |
+
+**一句话概括整课**：NativeMark 是作者造的"尺子"，m1/m2 提供"两个已知 ArtMethod 结构体 + 一个已知 C 函数地址"，InitMembers 用"暴力扫描 + 已知值比对"测出 ArtMethod 各字段偏移，存进 Member 对象，供 hook 改入口时使用。
+
+---
+
+## 第八课：Android::Init —— ELF 符号解析与符号地址计算（C 核心）
+
+> 本课对应 `Pine_init0` 的第 3 处细节：`Android::Init`（android.cpp:35-113）。这是整条链 C/OS 知识最密集的一块。
+> 核心解决一个问题：**hook 要调 libart.so 里的函数（如 SuspendVM），但编译时不知道它们的地址，必须在运行时从 libart.so 里"查符号"找出来。**
+
+### 一、学习策略：C 代码要不要每行都背？
+
+**结论：不用每行背。目标是"改 bug"，不是"重写 Pine"。**
+
+判断标准一句话：**这段代码真出 bug 时，您要改的是它本身，还是它的调用方？**
+
+| 层次 | 代码类型 | 要掌握的程度 | 本仓库对应 |
+| --- | --- | --- | --- |
+| 核心逻辑层 | hook 安装、backup/bridge 串联、ArtMethod 偏移探测 | 逐行懂，能改 | art_method.cpp 的 InitMembers/BackupFrom/AfterHook |
+| 工具成熟层 | ELF 解析、xz 解压、符号表遍历、mprotect | 懂原理 + 能定位到行，不用背算法 | elf_image.cpp、memory.h |
+| 架构汇编层 | 机器码跳板、arm64 汇编 | 懂"跳到哪"即可，最后啃 | trampoline/*.S |
+
+**为什么 ELF 解析这类"工具成熟层"不用逐行懂**，三个理由：
+
+1. 成熟代码，从 SandHook 继承，上万个 App 用了多年，`sh_offset`/`sh_entsize` 算法不会出 bug。
+2. 它真出 bug 的形态几乎只有一种——"某 ROM 的符号查不到"，修复点在"该查哪个符号名"，不在解析算法本身。
+3. ELF 是 Google 定死的标准格式，不会改，您改了反而坏事。
+
+**现成证据**（android.cpp:259-266）：
+
+```cpp
+//这里处理和系统规定不一致的特殊情况
+//honor magic 4 android 15 ,符号却是Android 14的版本
+```
+
+这证明：真正的 bug 来源是"哪个版本/厂商该查哪个符号名"，不是"符号表怎么遍历"。
+
+**一句话记牢**：ELF 解析是"查字典"的工具，字典算法不用背，但要背"该查哪个词"。
+
+### 二、为什么要有 Android::Init？
+
+之前 `InitMembers` 用扫描探测了 ArtMethod 自己的字段偏移。但 hook 还需要另一批东西：**ART 运行时（libart.so）里的函数地址**，比如 `SuspendVM`/`ResumeVM`（挂起/恢复 VM）、`ArtMethod::CopyFrom`（复制方法）。
+
+这些函数在 libart.so 里，是 Google 写的、版本各异的、编译时我们不知道地址的。`Android::Init` 的任务：**运行时从 libart.so 里把这些函数地址找出来，存进全局函数指针**，供 hook 调用。
+
+### 三、两种"方法"，两套拿地址的机制（重要区分）
+
+| | 是什么 | 例子 | 拿地址的方式 |
+| --- | --- | --- | --- |
+| ART 内部函数 | libart.so 里的 C++ 函数，Google 写的 | SuspendVM、ArtMethod::CopyFrom | ELF 符号解析（查符号表） |
+| 用户 hook 的 Java 方法 | App 里（或别人 App 里）的 Java 方法 | add()、testTouTiaoJSON() | JNI 传 jmethodID → ArtMethod，不查符号表 |
+
+**关键：hook 的业务方法走第二行，从头到尾不碰 ELF 符号表。**
+
+因为 Java 方法有 jmethodID 这个"身份证"：
+
+```
+Java 反射 getDeclaredMethod("add") → jmethodID → native FromReflectedMethod → ArtMethod 指针 → 改入口
+```
+
+业务方法编译在 dex 里，没有 C++ 符号名，也不在 libart.so 符号表里，所以"符号解析"对业务方法根本不存在。
+
+### 四、ELF 是什么（OS 核心概念）
+
+**ELF（Executable and Linkable Format）** 是 Linux/Android 可执行文件和共享库的标准格式。Android 的 `.so`（类似 Windows 的 DLL）、可执行文件都是 ELF。`libart.so` 就是一个 ELF 文件。
+
+一个 ELF 文件分成多个段（section），工程关心的几个：
+
+| 段名 | 存什么 | 作用 |
+| --- | --- | --- |
+| .text | 机器码 | 函数编译后的指令 |
+| .dynsym | 动态符号表 | 导出给外部用的符号 |
+| .dynstr | 动态字符串表 | 符号的名字（字符串） |
+| .symtab | 完整符号表 | 所有符号（含调试信息） |
+| .strtab | 字符串表 | 完整符号名字 |
+
+**符号表（symbol table）** = "符号名 → 地址偏移"的映射，像一个花名册。**符号就是函数或全局变量的名字**，符号表就是"名字 → 地址"的字典。
+
+找函数地址 = 拿着名字去符号表查偏移，再算真实地址。这就是 `GetSymbolAddress` 的全部。
+
+### 五、Android::Init 逐行（android.cpp:35-113）
+
+#### 第 1 步：存版本 + 拿 JavaVM（36-41）
+
+```cpp
+Android::version = sdk_version;
+if (env->GetJavaVM(&jvm_) != JNI_OK) abort();
+```
+
+**JavaVM vs JNIEnv**：JavaVM 是进程唯一、代表"虚拟机本身"、跨线程可用（全局）；JNIEnv 每线程一个、只当前线程用。`GetJavaVM` = 从当前线程 JNIEnv 拿全局 JavaVM，存进全局变量 `jvm_`，供后续其他线程用。
+
+**类比**：JavaVM 是"公司总部"（全局一个），JNIEnv 是"工牌"（每人一个，只在自己工位有效）。
+
+#### 第 2 步：打开 libart.so（43-62）
+
+```cpp
+ElfImage art_lib_handle("libart.so");
+if (!art_lib_handle.IsOpened()) {
+    // eng 调试版 ROM：libartd.so
+    // 阿里 YunOS：libaoc.so
+}
+```
+
+`ElfImage` 是本工程封装类（elf_image.h:43），负责"加载一个 ELF 文件、解析符号表"。构造时若打不开，依次兜底 `libartd.so`（eng 调试 ROM）、`libaoc.so`（YunOS AOC 运行时）——适配不同 ROM。
+
+**ElfImage::Open 内部（elf_image.cpp:22-59）**：
+
+```cpp
+int fd = WrappedOpen(path, O_RDONLY | O_CLOEXEC);   // ① 打开文件
+size_ = lseek(fd, 0, SEEK_END);                     // ② 求文件大小
+base_ = GetModuleBase(path);                        // ③ 找加载基址（关键！）
+header_ = mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd, 0);  // ④ mmap 映射
+ParseMemory(header_, false);                        // ⑤ 解析符号表
+```
+
+两个 OS 核心概念：
+
+**概念 A：mmap** —— 系统调用，把文件内容映射到进程虚拟内存。映射后文件内容像"内存数组"一样，可直接指针访问，不用 read 逐个读。
+
+**概念 B：GetModuleBase** —— 找加载基址（elf_image.cpp:235-260）。`libart.so` 被加载时映射到进程内存某基址（如 0x7f00000000），文件符号偏移 + 基址 = 运行时真实地址。基址从 **`/proc/self/maps`**（Linux 虚拟文件，记录进程所有内存映射）里解析出来。
+
+#### 第 3 步：按版本解析符号（64-95）
+
+```cpp
+if (Android::version >= Android::kR) {
+    suspend_all = ...GetSymbolAddress("_ZN3art16ScopedSuspendAllC1EPKcb");
+    resume_all  = ...GetSymbolAddress("_ZN3art16ScopedSuspendAllD1Ev");
+} else {
+    suspend_vm = ...GetSymbolAddress("_ZN3art3Dbg9SuspendVMEv");
+    resume_vm  = ...GetSymbolAddress("_ZN3art3Dbg8ResumeVMEv");
+}
+```
+
+两个知识点：
+
+**知识点 1：name mangling（名字捣碎）** —— 符号名是一堆乱码的原因。C++ 支持函数重载，同名函数参数不同，编译后必须有不同的符号名，否则链接器分不清。编译器把"函数名 + 参数类型"编码成唯一符号名。
+
+解码 `_ZN3art16ScopedSuspendAllC1EPKcb`：
+
+```
+_ZN  = C++ 名字捣碎前缀
+3art = 长度3 + "art"（命名空间）
+16ScopedSuspendAll = 长度16 + "ScopedSuspendAll"（类名）
+C1   = 构造函数
+E    = 参数列表开始
+PKc  = 参数 const char*（P=指针，K=const，c=char）
+b    = 参数 bool
+```
+
+翻译：`art::ScopedSuspendAll::ScopedSuspendAll(const char*, bool)` —— 构造函数。
+
+**知识点 2：函数指针** —— 存"函数机器码地址"的变量。
+
+声明格式：`返回类型 (*指针名)(参数类型列表)`
+
+```c
+int add(int a, int b) { return a + b; }
+int (*p)(int, int);   // 声明指针 p
+p = add;              // 函数名本身是地址
+int r = p(3, 4);      // 调用，等价 add(3,4)
+```
+
+`reinterpret_cast<void(*)(void*, const char*, bool)>` 把 `GetSymbolAddress` 返回的 `void*` 裸地址，强转成"能调用"的函数指针。函数指针本质 = 地址 + 签名约定，调用时就一条跳转指令。
+
+#### 第 4 步：GetSymbolAddress（elf_image.cpp:219-229）
+
+```cpp
+void *ElfImage::GetSymbolAddress(const char *name, ...) const {
+    if (!base_) return nullptr;
+    Elf_Addr offset = LinearLookup(name, out_size);   // ① 查偏移
+    if (!offset) return nullptr;
+    return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(base_) + offset - bias_);  // ② 算真实地址
+}
+```
+
+**真实地址 = 基址(base_) + 符号偏移(offset) - bias_**
+
+`bias_` 是文件偏移和虚拟地址的差异修正量，通常很小或为 0。
+
+#### 第 5 步：LinearLookup（elf_image.cpp:174-217）
+
+线性查找：逐个遍历符号表，用 `strcmp` 比较符号名，匹配就返回 `st_value`（偏移）。
+
+```cpp
+Elf_Sym *sym = dynsym_;
+for (Elf_Off i = 0; i < dynsym_count_; i++, sym++) {
+    if (strcmp(dynstr_ + sym->st_name, name) == 0)   // 符号名匹配？
+        return sym->st_value;                        // 返回偏移
+}
+```
+
+复杂度 O(n)，查一个符号扫一遍。所以代码注释写 `// TODO: hash based lookup`——作者知道慢，理想用哈希表（系统 dlsym 就是哈希 O(1)），但 Pine 不能直接用 dlsym（libart 很多符号是 hidden，不在 .dynsym 导出表里），只能自己解析 .symtab 完整符号表。
+
+### 六、DisableHiddenApiPolicy（android.cpp:115-165）
+
+**目的**：绕过 Android 9+ 的 hidden API 限制（非系统 App 访问 @hide 内部 API 会被拒绝）。Pine 自己要反射访问 ART 内部类/字段，被限制挡了，必须绕过。
+
+```cpp
+static int FakeHandleHiddenApi() {   // 假函数，永远返回 0
+    return 0;                        // 0 = false = "不拒绝访问"
+}
+
+trampoline_installer->NativeHookNoBackup(target, replace);  // inline hook 替换
+```
+
+**一句话**：ART 每次检查"该不该拒绝访问 hidden 成员"时，调用的其实是 Pine 塞进去的 `FakeHandleHiddenApi`，永远返回"不拒绝"，于是所有 hidden API 都能访问。
+
+### 七、答疑（本课所有提问）
+
+#### 问1：so 里的 add 方法，偏移量、内存地址怎么找？（结合 ELF + mmap）
+
+先区分两个易混淆的"偏移"：
+
+| 名称 | 含义 | 谁决定的 |
+| --- | --- | --- |
+| 文件偏移（sh_offset） | add 机器码在 .so 文件里第几个字节 | 编译/链接器按 ELF 段布局排的 |
+| 虚拟地址偏移（st_value / sh_addr） | add 在内存里相对"加载基址"的偏移 | 链接器分配的"逻辑地址" |
+
+这俩数字往往不相等（段之间有对齐填充）。
+
+运行时真实地址公式：`add 真实地址 = 加载基址(base_) + 虚拟地址偏移(st_value) - bias_`
+
+走一遍：系统 dlopen 加载 libfoo.so，mmap 映射到基址 0x7000000000；符号表查 "add" 得 st_value=0x1200；真实地址 = 0x7000000000 + 0x1200 = 0x7000001200。
+
+**mmap 的作用**：文件是"死"的，mmap 把它投影到内存后，文件内容才能被 CPU 当内存访问/执行，base_ 就是投影起点。
+
+**类比（Android）**：像 RecyclerView 的 LayoutManager。文件偏移 = 数据项在"数据源列表"的位置；虚拟地址偏移 = 该项在"屏幕可视区域"坐标；base_ = 屏幕起点。
+
+#### 问2：按版本解析符号干嘛的？定义固定吗？
+
+**干嘛的**：不同 Android 版本，ART 内部函数名字和签名都会变，要按版本查不同符号。Google 在 Android 11 把挂起 VM 从 `Dbg::SuspendVM()` 重构成 `ScopedSuspendAll` RAII 类，函数名参数全变，必须分开查。
+
+**定义完全不固定**，这正是 hook 维护最痛苦处：
+
+1. 版本会变（Android 大版本重构/改名/改签名）
+2. 厂商会变（荣耀 Magic4 是 Android 15 却用 Android 14 的符号，android.cpp:259-266）
+3. 架构会变（arm32 上某些函数被内联查不到，arm64 没有，android.cpp:148-151）
+
+这些乱码字符串是维护者从 AOSP 源码反查出来的 mangled 名。维护时遇到"符号查不到"，要做的**去对应版本 AOSP 源码查新符号名，不是改解析算法**。
+
+#### 问3：函数指针详细介绍
+
+见本课"五·第3步·知识点2"。本质 = 地址 + 签名约定，底层就一条跳转指令。类比 Java 接口回调，但更底层——Java 存对象引用靠虚方法分发，C 存纯地址 CPU 直接 jump。
+
+#### 问4：DisableHiddenApiPolicy 简要说明
+
+见本课"六"节。
+
+#### 问5：LinearLookup 举例说明（Android 代码类比）
+
+```java
+// Java 版：在联系人列表找名字匹配的人，返回电话
+String findPhone(List<Contact> list, String name) {
+    for (Contact c : list) {
+        if (c.name.equals(name)) return c.phone;
+    }
+    return null;
+}
+```
+
+对照 C 版（elf_image.cpp:174-185）：
+
+- `dynsym_` = `List<Contact>`（符号表，一个符号 = 一个 Contact）
+- `strcmp(...) == 0` = `c.name.equals(name)`（字符串比较，相等返回 0）
+- `sym->st_value` = `c.phone`（符号地址偏移）
+- 没找到返回 0 / null
+
+#### 问6：是不是每 hook 一个方法都要做一次符号解析？
+
+**不是。符号解析只发生在 Pine 初始化那一次，且只针对 libart.so 里 ART 自己的内部函数。业务方法走 jmethodID，不查符号表。**
+
+ART 内部函数：初始化时一次性查符号（几十个固定函数），存进全局函数指针，以后反复用不再查。
+业务方法：Java 反射 + JNI 传 jmethodID → ArtMethod 指针，不做任何符号解析。
+
+"同名不同参"也不混淆：业务方法的 Java 重载在 dex 里就是两个独立 ArtMethod + 两个不同 jmethodID，反射拿哪个就是哪个；libart 的 C++ 重载 mangled 名已编码参数类型（add(int)→_Z3addi，add(long)→_Z3addl），是不同的字符串。
+
+#### 问7：Pine hook 时要调用这些函数吗？算地址前重载/版本要做符号解析吗？
+
+**（1）对**：hook 安装改 ArtMethod 时，不能有别的线程同时在跑 Java 代码，所以 Pine_hook0 先 `suspend_vm()` 挂起 VM（stop-the-world），改完再 `resume_vm()`。这就是为什么要解析 SuspendVM。
+
+**（2）时间点纠正**：符号解析不是"用到时才做"，而是**初始化时一次性做完**，地址存进全局函数指针（Android::suspend_vm 等），以后 hook 只是"调用已算好的指针"，不再查符号表。
+
+**（3）重载/版本差异**：不是"存在才触发解析"，而是符号解析天生就要处理这两件事——mangled 已编码参数（解决重载），if/else 查不同字符串（解决版本）。都是初始化那一次写好，不是运行时动态发生。
+
+**类比**：符号解析 ≈ onCreate 里一次性 getSystemService() 存单例，以后直接单例调用，而不是每次 getSystemService。
+
+#### 问8：怎么知道哪些函数需要解析、哪些有重载？
+
+三部分来源：
+
+| 来源 | 性质 | 说明 |
+| --- | --- | --- |
+| 需求驱动 | 设计期主动 | Pine 功能要调 libart 哪个内部函数，就解析哪个 |
+| AOSP 源码 | 唯一事实来源 | 去 AOSP 查函数真实签名，算 mangled 名，对比版本差异 |
+| 测试出 bug | 运营期补 | 某厂商/架构/云机符号查不到，补 fallback 分支 |
+
+证据（测试踩坑后补的 fallback）：
+- 荣耀 Magic4（android.cpp:259-266）
+- arm32 内联（android.cpp:148-151）
+- 云机小米14 Pro（android.cpp:214-215）
+
+**维护工作流**（新增功能或修 bug 时）：去 AOSP 查签名 → 算 mangled 名（或用 c++filt 反查）→ 写 GetSymbolAddress("乱码串") + 按版本写 if/else → 真机各版本测试，查不到补 fallback。这一步不需要等 bug 才做。
+
+#### 问9：这部分代码/原理必须吃透吗？
+
+**分层**：
+
+| 子块 | 是否必须吃透 | 原因 |
+| --- | --- | --- |
+| 整体机制（符号名→地址流程） | 必须懂 | 理解 hook 地基 |
+| 版本分支逻辑（if/else 查新符号旧符号） | 必须懂，且要会改 | 真实 bug 高发区 |
+| 解析算法细节（sh_offset/sh_entsize/bias_/LinearLookup 逐行） | 不用吃透，懂原理即可 | 成熟代码不会出 bug |
+
+**类比**：RecyclerView 的 LayoutManager 内部回收算法懂"复用 View"即可，不用懂双向链表怎么维护；但"何时用 Linear 还是 Grid"必须懂。
+
+**收口**：机制要懂，版本分支要会改，算法细节放过。bias_、sh_entsize 这些知道"有这个东西、作用是修正偏移"即可，不用背公式。
+
+### 八、C 知识清单（本课掌握）
+
+| # | 知识点 | 一句话 |
+| --- | --- | --- |
+| 1 | ELF 格式 | Linux/Android 可执行文件标准，分 .text/.dynsym/.dynstr 等段 |
+| 2 | 符号表 | "符号名 → 地址偏移"的字典 |
+| 3 | JavaVM vs JNIEnv | JavaVM 全局唯一，JNIEnv 每线程一个 |
+| 4 | mmap | 系统调用，把文件映射到内存，指针直接访问 |
+| 5 | /proc/self/maps | Linux 虚拟文件，记录进程内存映射，找加载基址 |
+| 6 | name mangling | C++ 名字捣碎，解决重载；符号名是乱码的原因 |
+| 7 | 函数指针 | 存函数地址的变量，`返回值(*)(参数)` |
+| 8 | strcmp | C 字符串比较，相等返回 0 |
+| 9 | LinearLookup | 线性遍历符号表比对名字，O(n) |
+| 10 | 真实地址 = 基址 + 偏移 | 符号偏移 + 加载基址 = 运行时地址 |
+
+**一句话概括整课**：`Android::Init` 用 `ElfImage` 打开 libart.so，`mmap` 映射进内存，遍历符号表用 `strcmp` 比对（乱码符号名是 C++ name mangling 的结果），找到函数偏移后加基址算真实地址，存进全局函数指针，供 hook 调 ART 内部函数。
+
+---
+
+## 第九课：JNI 引用 RAII（ScopedLocalRef）与 jmethodID→ArtMethod（Require）
+
+> 本课对应 `Pine_init0` 第 4 处细节。为什么讲：第七课讲了 `InitMembers` 需要 m1/m2 两个 ArtMethod 指针，但没讲这两个指针怎么从"方法名"变出来。本课补上——就是 pine.cpp:114-117 三行。
+> 代码位置：pine.cpp:114-117，内部方法 `Require` 在 art_method.cpp:109-120，RAII 类在 scoped_local_ref.h。
+
+### 一、这三行在干嘛（一句话）
+
+```cpp
+// pine.cpp:114-117
+ScopedLocalClassRef Ruler(env, com___m4399___pierce___core___NativeMark);   // ① 拿 NativeMark 类
+auto m1 = art::ArtMethod::Require(env, Ruler.Get(), m1(), "(F)V", true);    // ② 拿 m1 的 ArtMethod
+auto m2 = art::ArtMethod::Require(env, Ruler.Get(), m2(), "()V", true);     // ③ 拿 m2 的 ArtMethod
+```
+
+**把"方法名 m1/m2"换成"它们的 ArtMethod 指针"**，交给后面的 `InitMembers` 用。
+
+### 二、进入内部方法 Require（art_method.cpp:109-120）
+
+```cpp
+ArtMethod* ArtMethod::Require(JNIEnv* env, jclass c, const char* name, const char* signature, bool is_static) {
+    jmethodID m = is_static ? env->GetStaticMethodID(c, name, signature)   // ① 按名字拿方法句柄
+                            : env->GetMethodID(c, name, signature);
+    if (Android::version >= Android::kR) {
+        if (reinterpret_cast<uintptr_t>(m) & 1) {                          // ② 判断最低位
+            ScopedLocalRef javaMethod(env, env->ToReflectedMethod(c, m, ...));
+            return GetArtMethodForR(env, javaMethod.Get());                // ③ 绕道读字段
+        }
+    }
+    return reinterpret_cast<ArtMethod*>(m);                                // ④ 直接强转
+}
+```
+
+C++ 语法点出（简单一句）：
+- **三目运算符** `条件 ? 值1 : 值2`：`is_static` 为真用 `GetStaticMethodID`，否则用 `GetMethodID`。
+- **`reinterpret_cast<uintptr_t>(m)`**：把 jmethodID 这个指针值重新解释成整数，才能做 `& 1` 位运算（指针不能直接位与）。
+
+**唯一要记的坑：jmethodID 在 Android R 前后含义变了。**
+
+- **Android < R**：`jmethodID` 的值**就是 ArtMethod 结构体地址**，直接 `reinterpret_cast` 强转（第④步）。
+- **Android >= R**：Google 改了实现，`jmethodID` 不再是直接指针。判断方式 `& 1` 看最低位——ArtMethod 地址是 8 字节对齐的，最低位本该是 0，R 版本拿它当标志位。是 1 就绕道：`ToReflectedMethod` 拿回 Java 的 `Method` 对象，再进 `GetArtMethodForR`（art_method.h:35-42）读它的 `artMethod` 字段（这个字段仍存真实指针）。
+
+**类比（Android）**：R 之前 jmethodID 是"员工本人"，R 之后变成"工牌号"，要拿工牌去查档案才能找到真人。
+
+### 三、RAII 类 ScopedLocalClassRef（scoped_local_ref.h）
+
+`Ruler` 就是 `ScopedLocalClassRef`，它管一个 JNI 的坑：
+
+**`FindClass` 返回的 jclass 是 "local ref"，有数量上限（约 512/低内存 16），用完不 `DeleteLocalRef` 会堆满崩溃。**
+
+`ScopedLocalClassRef` 用 **RAII**（C++ 版 try-with-resources）解决：构造时拿引用，对象离开作用域时析构自动 `DeleteLocalRef`。你只管用，不用记着删。
+
+C++ 语法点出：`ScopedLocalClassRef` 是 `ScopedLocalRef<jclass>` 的子类（继承），`<jclass>` 是**模板**（一份代码适配多种类型，类比 Java 泛型）。析构函数 `~ScopedLocalRef()` 里调 `Reset()` 自动删引用——这就是 RAII 的落点。
+
+**类比（Android）**：就像 Bitmap 要手动 recycle，这个类等于帮你自动 recycle 的包装。
+
+### 四、本课要点清单
+
+| 要点 | 一句话 |
+| --- | --- |
+| jmethodID 版本坑 | < R 是 ArtMethod 指针；>= R 变了，靠 `& 1` 判断是否绕道 |
+| local ref 泄漏 | FindClass 返回的 jclass 有上限，用完要删，RAII 自动删 |
+| 调用链 | `Require` → `GetStaticMethodID` →（R 版本）`ToReflectedMethod` → `GetArtMethodForR` |
+
+**一句话概括整课**：`ScopedLocalClassRef` 用 RAII 自动管理 JNI local ref（防泄漏/防超限崩溃），`Require` 负责把"方法名"转成"ArtMethod 指针"——`< R` 直接强转 jmethodID，`>= R` 绕道 Method 对象的 `artMethod` 字段。
+
+---
+
+## 第十课：REPLACEMENT 模式总收口 —— 用 add(a,b) 走完整条 hook 链路
+
+> 本课是 REPLACEMENT 模式（Android O+ 默认）的**最终收口**：把前面第一课到第九课散落的点，用 `int add(int a, int b)` 一个例子串成一条完整链路，并对 BackupFrom 的 JIT/GC 迁移做**图解法**详解。
+> 注意：本课基于**当前分支**的最新代码（`AfterHook` 签名已从旧的 `is_native_or_proxy` 拆成 `is_native, is_proxy`，并新增 kFastNative/kCriticalNative 清除）。
+
+### 一、两个贯穿全局的前置概念（先钉死，后面全用它）
+
+#### 概念 1：偏移（offset）是"刻度"，入口值（value）是"读数"
+
+init0 扫描算出来的是**偏移 offset**（"这个字段在 ArtMethod 的第几个字节"），全局一份、所有方法通用。hook 时才是拿这个刻度去某个具体方法（add）的对象上**读写读数**。
+
+看 `Member::Set`（member.h:36-41）就一目了然：
+
+```cpp
+void Set(IType* instance, MType value) {
+    memcpy(reinterpret_cast<void*>((uintptr_t) instance + offset), &value, sizeof(MType));
+}
+```
+
+公式：**字段实际地址 = ArtMethod 实例基址(instance) + 偏移(offset)**。
+
+| 概念 | 谁 | 什么时候 | 含义 |
+|------|-----|---------|------|
+| 偏移 offset（刻度） | init0 扫描得到 | 初始化时，一次性 | "入口字段在第 40 字节" |
+| 入口值 value（读数） | 每个方法各自 | hook 时用 offset 读 | "add 这个字段存的是 0x7000" |
+
+类比 Android：init0 给一张"户型图"（每房间在第几格），hook 才拿图去某一户（add）找卧室看里面放了啥、再换掉它。
+
+#### 概念 2：ArtMethod 只是"户口本"，执行逻辑（机器码/字节码）在别处
+
+一个方法的"执行逻辑"在内存里有两个形态，**都不在 ArtMethod 结构体里**：
+
+| 形态 | 存哪 | 谁用 | 什么时候有 |
+|------|------|------|-----------|
+| 字节码 bytecode | dex 文件的 code_item | 解释器 | App 安装就有 |
+| 机器码 compiled code | JIT 编译出的可执行内存 | CPU 直接跑 | 方法被 JIT 编译后 |
+
+ArtMethod 结构体本身只是"户口本"（存名字、access_flags、所属类、**入口指针**），不含执行逻辑。它最关键的字段 `entry_point_from_compiled_code_` 是个**指针**，指向机器码入口。
+
+**关键结论（贯穿 hook 本质）**：`BackupFrom` 里的 `copy_from` 只拷贝 ArtMethod 这个"户口本"（几十字节的元数据），**不拷贝机器码、也不拷贝字节码**。机器码（0x7000）和字节码（dex 里）从头到尾都只有一份，backup 是"复用"而非"拷贝"。
+
+---
+
+### 二、REPLACEMENT 完整链路一张图
+
+```
+【Java 层 —— 装前准备】
+Pierce.hook(add, callback)
+  └─ ensureInitialized() → initialize()
+       └─ 加载 libpierce.so + init0（扫描 ArtMethod 字段偏移，量刻度）
+  └─ getArtMethod(add)             // Java Method → add 的 ArtMethod* 指针
+  └─ 登记 HookRecord（一次 ArtMethod 一次）
+  └─ hookNewMethod()
+       ├─ 定模式：O+ → REPLACEMENT（isInlineHook=false）
+       ├─ 收集参数类型 paramTypes = [int, int]
+       ├─ genereateDexAndLoad()     // 生成 bridge/backup dex 并加载
+       └─ hook0(...)  ←———— Java/native 边界
+
+【C 层 Pine_hook0（pine.cpp:203-330）—— 核心大代码】
+  Seg1  拿三个 ArtMethod*：target(add) / bridge / backup
+  Seg2  bridge->Compile() 编译 bridge，拿最佳入口
+  Seg3  ScopedSuspendVM 挂起全线程（stop-the-world）
+        ├─ ① InstallReplacementTrampoline(target, bridge)  改 add 入口 → 跳板
+        ├─ ② backup->BackupFrom(target, call_origin, ...)   把 add 状态拷进 backup
+        └─ ③ target->AfterHook(...)                         处理 add 的 flags 防 JIT
+  Seg4  SetLongField 写 debug 字段 → 返回 javaBackup
+
+【运行时 —— 一次 add(1,2) 调用】
+  add(1,2) → 入口=跳板 → bridge → handleCall(回调分发) → before → backup(原逻辑) → after
+```
+
+---
+
+### 三、三个核心动作的"状态变化表"
+
+先约定地址（假设值，方便跟踪）：
+
+| 符号 | 地址 | 含义 |
+|------|------|------|
+| `0x7000` | add 原始机器码入口 | add 编译后的真实代码 |
+| `0x8000` | bridge 编译后入口 | bridge 方法代码 |
+| `0x9000` | 跳板 | CreateMethodJumpTrampoline 分配的可执行内存 |
+
+#### ① `InstallReplacementTrampoline(target, bridge)`（trampoline_installer.cpp:168-201）—— 只动 add 入口指针
+
+```cpp
+void *target_origin_code_entry = target->GetEntryPointFromCompiledCode(); // 记下 0x7000
+void *method_jump_trampoline = CreateMethodJumpTrampoline(bridge);        // 造跳板，写死 bridge 入口
+target->SetEntryPointFromCompiledCode(method_jump_trampoline);            // add 入口改成 0x9000
+return target_origin_code_entry;                                          // 返回 0x7000（=call_origin）
+```
+
+| 对象 | hook 前入口 | hook 后入口 |
+|------|------------|------------|
+| target (add) | `0x7000` | `0x9000`（跳板） |
+| bridge | `0x8000` | 不变 |
+| backup | 未设置 | 未设置 |
+
+**本质**：把 add 的 `entry_point_from_compiled_code_` 从真代码改成跳板。跳板里写死 bridge 入口，之后谁调 add 都先跑跳板再拐 bridge。
+
+返回值 `0x7000` 是 add 的**原始入口**——replacement 唯一需要"备份"的东西就是这个地址（机器码没被动过，还在 0x7000 躺着）。这正是 replacement 比 inline 简单之处：**inline 要备份"被覆盖的机器码"，replacement 只备份"一个地址"**。
+
+> 代码里有一段注释掉的 `call_origin_trampoline`（trampoline_installer.cpp:182-186）：原版 Pine 会用 `CallOriginTrampoline` 把 r0 寄存器设成原方法再跳原入口，但实测**异常回溯栈时会变僵尸线程**，故弃用，直接返回裸地址。
+
+#### ② `backup->BackupFrom(target, 0x7000, false, false, false)`（art_method.cpp:346-446）—— 重点，见第四节
+
+结果：
+
+| 属性 | add (target) | backup |
+|------|-------------|--------|
+| 方法体逻辑 | 原 add 逻辑 | 复制了 add 的"户口本"（元数据） |
+| 入口 | `0x9000`（跳板） | `0x7000`（add 原代码） |
+| access_flags | 加 kAccCompileDontBother | 改成 private + kAccCompileDontBother |
+
+#### ③ `target->AfterHook(false, false, false)`（art_method.cpp:448-519）
+
+给 target 加 `kAccCompileDontBother`（禁止 JIT 再编译它，防止 hook 后入口被 JIT 改回），清 fast-interpreter 缓存标志，设解释器入口。详见第五节。
+
+---
+
+### 四、BackupFrom 详解（art_method.cpp:346-446）—— 最容易出 bug 的方法
+
+它做四件事：
+
+#### 第 1 件：复制"户口本"（347-358）
+
+```cpp
+if (LIKELY(copy_from)) {
+    copy_from(this, source, sizeof(void*));   // 调 ART 官方 ArtMethod::CopyFrom
+} else {
+    memcpy(this, source, size);               // 老 Android 兜底：裸 memcpy
+}
+```
+
+**为什么优先 `copy_from` 而非 `memcpy`**：原版 Pine 用 memcpy 整块拷贝，但 ArtMethod 里有 `GcRoot<Class> declaring_class_` 字段——GC 移动类对象时只更新"原始 ArtMethod"里的地址，不会更新 memcpy 出来的那份，导致 backup 存过期类指针、访问崩溃。`copy_from`（ART 官方 CopyFrom）知道这些字段存在，会正确修正 GcRoot，还顺带处理 JIT 入口、Nterp 入口、hotness counter。**注意：copy_from 拷贝的是"户口本"结构体，不是机器码/字节码。**
+
+#### 第 2 件：修 access_flags（360-375）
+
+```cpp
+uint32_t access_flags = source->GetAccessFlags();
+if (Android::version >= Android::kN) {
+    if (Android::version >= Android::kR) access_flags &= ~kAccPreCompiled;
+    access_flags |= kAccCompileDontBother;         // 禁止 JIT 编译 backup
+}
+if ((access_flags & AccessFlags::kStatic) == 0) {   // 非静态方法（add 就是）
+    access_flags &= ~(AccessFlags::kPublic | AccessFlags::kProtected);
+    access_flags |= AccessFlags::kPrivate;          // 改成 private，当 direct method 调
+}
+access_flags &= ~AccessFlags::kConstructor;
+SetAccessFlags(access_flags);
+```
+
+三个目的：`kAccCompileDontBother` 别让 JIT 编译 backup；非静态改 `kPrivate` 让 backup 能当直接方法被调用；清 `kConstructor`（backup 不是构造器）。
+
+#### 第 3 件：JIT 信息迁移（387-431）—— 核心，野指针的根
+
+**为什么要处理**：hook 把 add 入口从 0x7000 改成 0x9000 后，ART 的 GC 里有一张表 `method_code_map_`（JitCodeCache 维护）记录"哪段机器码属于哪个方法"。此时表里还写着"0x7000 属于 add"，但 add 入口已不再指向 0x7000，GC 判定"0x7000 没人用了"→ **回收**。可 backup 入口刚被我们指向 0x7000 → backup 指向被释放的内存 → 野指针（UAF）随机崩溃。
+
+```cpp
+bool clear_jit_info_ref = Android::version >= Android::kN && !is_proxy;  // 390
+if (LIKELY(clear_jit_info_ref)) {
+    enterMoveJitInfo = Android::MoveJitInfo(source, this);   // 398 先尝试"迁移"
+    clear_jit_info_ref = !enterMoveJitInfo;
+    if (UNLIKELY(clear_jit_info_ref)) {
+        clear_jit_info_ref = !is_inline_hook && !is_native && art_quick_to_interpreter_bridge;  // 405
+    }
+}
+if (UNLIKELY(clear_jit_info_ref)) {
+    // 迁移失败 → 清引用：backup 走解释器，别碰可能被回收的机器码
+    SetEntryPointFromCompiledCode(art_quick_to_interpreter_bridge);  // 411
+    if (Android::version < Android::kS) {
+        entry_point_from_jni_.Set(this, nullptr);                     // 421
+    }
+} else {
+    // 迁移成功 → backup 入口 = add 原入口 0x7000
+    SetEntryPointFromCompiledCode(entry);                             // 424
+    if (UNLIKELY((is_native || is_proxy) && Android::version >= Android::kO)) {
+        SetEntryPointFromJni(source->GetEntryPointFromJni());        // 429 恢复 proxy/native 的 jni 入口
+    }
+}
+```
+
+**用内存图理解（这是重点）**：
+
+```
+【hook 前，一切正常】
+add 的 ArtMethod                          JIT 机器码
+┌──────────────────────┐                 ┌──────────────────────┐
+│ entry_point = 0x7000 │──指向──────────►│ 0x7000: add 的机器码 │
+└──────────────────────┘                 └──────────────────────┘
+method_code_map_ 表：{ 0x7000 → add }    ← GC 靠它判断，add 在用 → 不回收
+
+【hook 后（改了 add 入口），危机出现】
+add 的 ArtMethod                          JIT 机器码
+┌──────────────────────┐                 ┌──────────────────────┐
+│ entry_point = 0x9000 │──►跳板           │ 0x7000: add 的机器码 │
+└──────────────────────┘                  └──────────────────────┘
+                                              ▲
+backup 的 ArtMethod                          │
+┌──────────────────────┐                     │
+│ entry_point = 0x7000 │────────────────────┘  ← backup 还指着它
+└──────────────────────┘
+method_code_map_ 表：{ 0x7000 → add }   ← 表还写"属于 add"，但 add 不要了 → GC 会回收 → backup 野指针！
+
+【迁移成功（MoveJitInfo 把表改掉）】
+method_code_map_ 表：{ 0x7000 → backup }  ← 过户给 backup
+backup.entry_point = 0x7000               ← 和表一致 → GC 不回收 → 安全
+
+【迁移失败（主动放弃用机器码）】
+backup.entry_point = 解释器入口           ← 不再指向 0x7000，改走解释器读字节码
+backup.entry_point_from_jni = nullptr     ← 清空，防止还藏旧机器码引用
+0x7000 机器码：没人引用了，GC 爱收不收，backup 不用了。
+```
+
+**关键区分（迁移失败清空 vs GC 清理）**：
+
+| 方式 | 谁动手 | 时机 | 结果 |
+|------|--------|------|------|
+| GC 回收（被动） | GC | 不可控 | backup 还在用 0x7000 就被删 → 野指针崩溃 |
+| 迁移失败清空（主动） | 我们的代码 | hook 时先下手 | 先让 backup 不依赖 0x7000，GC 后面爱收不收 → 安全 |
+
+一句话：**迁移成功 = 把机器码在 `method_code_map_` 表里的归属从 add 过户给 backup；迁移失败 = 让 backup 改走解释器，主动放弃机器码，宁可慢也不碰会变野指针的内存。**
+
+> 补充：405 行的二次条件 `!is_inline_hook && !is_native`——inline 模式（机器码被覆盖了、走 backup 的 trampoline）或 native 方法（入口是 jni 函数地址，不是机器码，GC 不回收）即使迁移失败也不清空，直接走 else 设入口。
+
+> 关于"字节码会不会被 GC 破坏"：字节码归"类"管（backup 的 declaring_class 还引用着类，类不卸载字节码就在），机器码 GC（JitCodeCache）只回收"JIT 编译出来的机器码"，**管不着 dex 里的字节码**。所以迁移失败走解释器是安全的。
+
+#### 第 4 件：打日志（433-445）
+
+纯调试，跳过。
+
+---
+
+### 五、AfterHook 详解（art_method.cpp:448-519）
+
+```cpp
+void ArtMethod::AfterHook(bool is_inline_hook, bool is_native, bool is_proxy) {
+    uint32_t access_flags = GetAccessFlags();
+
+    if (Android::version >= Android::kN) {                 // ≥N 禁止被 JIT 再编译
+        if (Android::version >= Android::kR) access_flags &= ~kAccPreCompiled;
+        access_flags |= kAccCompileDontBother;
+    }
+    if (Android::version >= Android::kO && !is_inline_hook) {
+        if (UNLIKELY(PineConfig::debuggable && !(is_native || is_proxy))) {
+            access_flags |= AccessFlags::kNative;          // debug 模式防解释器忽略 entry_point
+        }
+    }
+    if (Android::version >= Android::kQ) {
+        access_flags &= ~AccessFlags::kFastInterpreterToInterpreterInvoke;  // 清 fast 解释器缓存标志
+    }
+
+    bool hasNativeFlags = (access_flags & AccessFlags::kNative) != 0;
+    if (UNLIKELY(hasNativeFlags)) {
+        // FastNative/CriticalNative 执行时 GC 被禁用，可能死锁，hook 方法不能带这两个标志
+        access_flags &= ~AccessFlags::kFastNative;
+        if (Android::version >= Android::kP) access_flags &= ~AccessFlags::kCriticalNative;
+    }
+
+    SetAccessFlags(access_flags);
+
+    if (art_interpreter_to_compiled_code_bridge) {
+        SetEntryPointFromInterpreter(art_interpreter_to_compiled_code_bridge);  // 设解释器入口
+    }
+}
+```
+
+**核心作用**：防止 ART 的 JIT/内联/解释器把 hook 绕过或还原。
+
+- `kAccCompileDontBother`：给 JIT 打"别动我"标记，防它重编译 target 把入口改回。
+- `kFastNative`/`kCriticalNative` 清除（**当前分支新增**）：这两个标志会让方法在执行时禁用 GC，hook 方法不能带（否则可能死锁）。
+- 设解释器入口为 `interpreter→compiled bridge`，保证走解释器路径时也能正确进 compiled 代码。
+
+---
+
+### 六、完整走查：`calculator.add(1, 2)` 一次调用
+
+hook 完成后，三个方法的状态：
+
+| 角色 | 是什么 | entry_point 指向 | 谁调它 |
+|------|--------|-----------------|--------|
+| target (add) | 你 hook 的原方法 | `0x9000`（跳板） | 业务代码照常调 add |
+| bridge | 新入口（拦截） | 自己的 body | 跳板拐进来的 |
+| backup | 原方法替身 | `0x7000`（原代码） | bridge 的 handleCall 里调 |
+
+```
+1. calculator.add(1,2)
+2. 读 target.entry_point → 是跳板（不是原逻辑了）
+3. 跳板 → 拐进 bridge
+4. bridge body 执行：handleCall(artTargetMethod, this, [1, 2])
+5. handleCall 里：
+     a. 查 HookRecord（artTargetMethod 反查）→ 找到你的 MethodHook
+     b. 调 beforeCall（可改参数，比如 a 改成 10）
+     c. 调 invokeOriginalMethod → 实际调 backup
+            ↓
+        backup.entry_point → 0x7000 原机器码 → 执行 a+b → 返回（10+2=12）  ← 原逻辑在这跑
+     d. 调 afterCall（可改返回值）
+6. handleCall 返回最终结果
+7. calculator.add(1,2) 拿到结果
+```
+
+---
+
+### 七、收口记忆点
+
+| # | 记忆点 | 一句话 |
+|---|--------|--------|
+| 1 | hook 本质 | 改指针，不改代码——机器码/字节码都是原方法那一份，backup 靠指针复用 |
+| 2 | 偏移 vs 值 | init0 量"刻度"（偏移），hook 用刻度读写"读数"（某方法的入口值） |
+| 3 | 三个方法分工 | target 被截走、bridge 拦截分发、backup 保存原逻辑 |
+| 4 | 三核心动作 | InstallReplacementTrampoline 改入口、BackupFrom 复制+迁 JIT、AfterHook 防 JIT |
+| 5 | JIT 迁移 | 机器码在 method_code_map_ 表里的归属从 add 过户给 backup；失败就走解释器 |
+| 6 | copy_from 拷什么 | 只拷 ArtMethod 结构体（户口本），不拷机器码/字节码 |
+
+**一句话概括整课**：REPLACEMENT hook 就是"改 add 的入口指针指向跳板（InstallReplacementTrampoline）→ 把 add 的户口本复制给 backup 并迁移 JIT 归属（BackupFrom）→ 给 add 打防 JIT 标记（AfterHook）"，原逻辑从头到尾没动过，backup 靠指针指向原机器码执行。
 
 ---
