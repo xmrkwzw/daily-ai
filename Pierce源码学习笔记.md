@@ -2310,3 +2310,517 @@ hook 完成后，三个方法的状态：
 **一句话概括整课**：REPLACEMENT hook 就是"改 add 的入口指针指向跳板（InstallReplacementTrampoline）→ 把 add 的户口本复制给 backup 并迁移 JIT 归属（BackupFrom）→ 给 add 打防 JIT 标记（AfterHook）"，原逻辑从头到尾没动过，backup 靠指针指向原机器码执行。
 
 ---
+
+## 第十一课：汇编与底层基础（为 INLINE hook 打底）
+
+> INLINE hook 改的是**机器码**，所以必须先补齐"字节码/机器码/内存/寄存器/汇编指令"这层地基。本课不背编码，只求"看得懂跳板在干什么"。
+
+### 一、三种"码"：源码 / 字节码 / 机器码
+
+```
+Java 源码  add(int a,int b){return a+b;}
+    │ javac / kotlinc 编译
+    ▼
+【字节码 bytecode】  ← 存 dex 文件里，给"虚拟机"看
+    │                 例：invoke-static、add-int、return
+    ├── 解释器直接读它执行（慢）        ← 迁移失败走的就是这条路
+    └── JIT/AOT 编译器把它编译成 ↓
+              ▼
+【机器码 machine code】 ← 存内存里，给"CPU"看
+                          例：0x0B020020（一条 add 指令）
+                          ↑ 这才是 INLINE hook 要改的东西
+```
+
+| 概念 | 谁看 | 存哪 | 指令长度 |
+|------|------|------|---------|
+| 字节码 | ART 虚拟机（解释器） | dex 文件 | 1~3 字节，变长 |
+| 机器码 | CPU 硬件 | 内存（代码段） | arm64 固定 4 字节；thumb2 混合 2/4 字节 |
+
+**关键分界**：INLINE hook 改**机器码**（CPU 层）；REPLACEMENT 改**入口指针字段**（ART 层）。
+
+### 二、内存基础（INLINE hook 必须懂的 5 点）
+
+**1. 地址 / 字节 / bit**：内存最小单位 = 1 字节(byte) = 8 bit，每个字节有唯一编号 = 地址。内存物理上只有 0/1，"是不是指令"取决于 CPU 从哪按指令解码。
+
+**2. 内存分页 + 权限（INLINE 的拦路虎）**：内存按"页"管理（通常 4KB/页），每页有权限标志：`r` 可读 / `w` 可写 / `x` 可执行。
+
+- 代码段（.text）默认 = **r-x**（可读可执行、**不可写**）——安全设计，防止程序改自己代码。
+- 数据段默认 = rw-。
+
+**这就是 INLINE hook 必须先 `Unprotect` 的原因**：要改 add 的机器码（代码段），得先用 `mprotect` 把那一页改成 `rwx`：
+
+```cpp
+// memory.h:19-28
+mprotect(页对齐地址, page_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+```
+
+> 也解释了 Android 10 部分机型崩溃——那些机型把代码段设成 **execute-only（只有 x，没有 r）**，连读都不行，备份机器码时一读就 SIGSEGV。
+
+**3. 栈（sp）**：`sp`（Stack Pointer）指向当前函数栈顶，函数调用时存局部变量、返回地址。arm32 里 `str r4, [sp, #-128]` 就是"把 r4 存到 sp-128 处"（压栈）。跳板是插入的纯汇编，**不能破坏原来的栈**，否则函数返回时找不到回去的路。
+
+**4. 指令缓存 I-cache**：CPU 内部缓存最近执行的机器码。改了内存里的机器码但缓存还是旧的 → **必须 `FlushCache` 显式刷新**，否则 CPU 还执行旧指令。
+
+**5. 指令长度（决定覆盖多少字节）**：
+
+| 架构 | 指令长度 | 后果 |
+|------|---------|------|
+| arm64 | **固定 4 字节** | 一条跳转要 16 字节（4 条组合）；方法至少 16 字节才能 inline |
+| thumb2 | **混合 2/4 字节** | 备份时可能截断到"半条指令"（4-2-4 问题），要特殊处理 |
+
+对应 `trampoline_installer.cpp:226-230` 注释表：
+
+```
+//                       原函数被改写的大小    实际被拷贝的大小
+// arm64                     16                  16
+// arm64                     24                  24
+// thumb2                    8                   8或10(4+2+4)
+// thumb2                    12                  12或14(4+4+2+4)
+```
+
+### 三、寄存器（硬件规定，名字固定）
+
+**寄存器名字是 CPU 硬件规定好的，不能自己编**，能决定的只是"用哪一个"。
+
+**ARM64（64 位）**：
+
+| 名字 | 全称 | 说明 |
+|------|------|------|
+| `x0` ~ `x30` | eXtended register | 31 个通用寄存器，各 64 位 |
+| `w0` ~ `w30` | Word register | 上面那些的**低 32 位**（同一物理寄存器换小号看） |
+| `sp` | Stack Pointer | 栈指针 |
+| `pc` | Program Counter | 程序计数器，**arm64 不能直接写** |
+| `xzr`/`wzr` | Zero register | 恒为 0 的假寄存器 |
+| `x29` = `fp` | Frame Pointer | 栈帧指针 |
+| `x30` = `lr` | Link Register | 函数返回地址 |
+| `x16`/`x17` | Intra-Procedure-call scratch (IP0/IP1) | **临时寄存器**，跳板最爱 |
+
+**ARM32（32 位）**：
+
+| 名字 | 全称 | 说明 |
+|------|------|------|
+| `r0` ~ `r15` | Register 0~15 | 16 个通用寄存器 |
+| `r13` = `sp` | Stack Pointer | 栈指针 |
+| `r14` = `lr` | Link Register | 返回地址 |
+| `r15` = `pc` | Program Counter | **arm32 的 pc 可以像普通寄存器一样直接写** |
+| `r12` = `ip` | Intra-Procedure scratch | 临时寄存器 |
+
+> **两架构最大区别**：arm32 的 `pc` 可被直接写（`ldr pc, xxx` 一句跳转）；arm64 的 `pc` 只读，必须 `ldr x17, xxx` + `br x17` 两步。这就是 arm64 一条跳转要 16 字节、arm32 只要 4 字节的原因。
+
+**ART 的调用约定（两套架构一致）**：`x0`/`r0` = 被调方法的 **ArtMethod\***；`x1`~`x7`/`r1`~`r3` 才是真正的参数。
+
+> 写法澄清：`ldr r, xxx` 里的 `r` 是**占位符**，不是真实寄存器名。arm32 中 `r0` 是真实寄存器名（register 0）；arm64 中要写 `x0`。本笔记一律用真实名字。
+
+### 四、本项目用到的汇编指令（全称 + 例子）
+
+清单从 `arm64.S` / `arm32.S` / `thumb2.S` 逐条提取。
+
+**A. 数据搬运**
+
+| 指令 | 全称 | 人话 | 本项目例子 |
+|------|------|------|-----------|
+| `ldr` | **LoaD Register** | 从内存读一个值进寄存器 | arm64.S:47 `ldr x0, [dest_method]` |
+| `str` | **STore Register** | 把寄存器值写进内存 | arm32.S:35 `str r1, [ip, #4]` |
+| `mov` | **MOVe** | 搬运值/立即数 | arm32.S:27 `mov r0, #0` |
+
+例子说明：`ldr x0, [dest_method]` —— 假设 `dest_method` 处存着 `0x5100`，执行后 `x0 = 0x5100`。
+
+**B. 跳转（改 pc）**
+
+| 指令 | 全称 | 人话 | 本项目例子 |
+|------|------|------|-----------|
+| `br` | **Branch Register** | 跳到寄存器里存的地址（arm64 专用） | arm64.S:49 `br x17` |
+| `b` | **Branch** | 跳到标签（编译时地址固定） | arm64.S:26（`bne`） |
+| `bne` | **Branch if Not Equal** | 不相等则跳 | arm64.S:26 |
+| `bl` | **Branch with Link** | 跳转并保存返回地址（函数调用） | 本项目未用 |
+| `ldr pc, XXX` | LoaD Register into PC | arm32/thumb2 的跳转写法 | thumb2.S:14 |
+| `ldrne pc, XXX` | LoaD into PC if Not Equal | 带条件的跳转 | arm32.S:19 |
+
+**C. 比较与条件**
+
+| 指令 | 全称 | 人话 | 本项目例子 |
+|------|------|------|-----------|
+| `cmp` | **CoMPare** | 比较，结果进"标志位"（不占寄存器） | arm64.S:25 `cmp x0, x17` |
+| `cmpeq` | CoMPare if EQual | 条件成立才比较 | arm32.S:29 |
+| `IT NE` | **If-Then, Not Equal** | thumb2 特有：声明下一条在 NE 条件下执行 | thumb2.S:22 |
+
+**D. 原子操作与同步（arm32 多线程 CAS 自旋锁）**
+
+| 指令 | 全称 | 人话 | 本项目例子 |
+|------|------|------|-----------|
+| `ldrex` | **LoaD Register EXclusive** | 独占读（标记内存，别核不能插） | arm32.S:24 |
+| `strex` | **STore Register EXclusive** | 独占写（没被别人动过才成功） | arm32.S:28 |
+| `wfene` | **Wait For Event, Not Equal** | 省电等待（别空转烧电） | arm32.S:26 |
+| `dmb` | **Data Memory Barrier** | 内存屏障（防 CPU 乱序执行） | arm32.S:31 |
+
+> `ldrex` + `strex` 成对 = **原子操作**（读-改-写不被别的线程插入），这就是博客里"多线程存参数防冲突"的 CAS 自旋锁。
+
+**E. 伪指令（汇编器指示，CPU 不执行！）**
+
+| 伪指令 | 全称 | 作用 | 例子 |
+|--------|------|------|------|
+| `.long` | — | 放 4 字节数据（初值 0） | arm64.S:51 `.long 0` |
+| `.align` | ALIGN | 对齐到 N 字节边界 | arm64.S:3 `.align 4` |
+| `.global` | GLOBAL | 导出符号，供 C 引用 | arm64.S:4 |
+| `.data` | DATA | 声明数据段 | arm64.S:2 |
+| `.thumb`/`.thumb_func` | — | 声明 thumb2 指令 | thumb2.S:4-5 |
+| `FUNCTION(name)`/`VAR(name)` | 宏 | 展开为 `.global` + `名字:`（给位置起名并导出） | arm64.S:1-10 |
+
+> **关键区分**：`ldr x0, [xxx]` 是**指令**（CPU 执行）；`.long 0` 是**数据**（CPU 不执行，被 `ldr` 读走）。**同一段内存里指令和数据混着放**，这正是跳板"模板+空位"的巧妙处。
+
+**F. 其他**
+
+| 指令 | 全称 | 人话 | 例子 |
+|------|------|------|------|
+| `nop` | **No OPeration** | 空操作，占位/反检测 | arm64.S:75 |
+
+### 五、四个关键澄清
+
+**澄清 1：为什么 `ldr` 到 pc 就变成跳转？**
+
+CPU 的工作循环是死循环：
+
+```
+① 读 pc 指向的地址 → 取指令
+② 执行
+③ pc = pc + 4
+④ 回到 ①
+```
+
+**"跳转"的本质就是"pc 被改成了别的值"**。`ldr pc, xxx` 恰好就是把 xxx 写进 pc。
+
+| 操作 | pc 变了吗 | 结果 |
+|------|----------|------|
+| `ldr x0, [x1]` | 没变 | x0 多个值，CPU 照旧继续 |
+| `ldr pc, [x1]` | **变了** | 下次从新 pc 取指令 = **跳转** |
+
+**是"目标是 pc"决定跳转，不是"内容是地址"**。同一地址装进 x0 什么都不发生，装进 pc 就跳走。
+
+arm64 的 pc 只读，所以用 `br`（Branch Register，专职把 pc 设为某寄存器值）替代：`ldr x17, 标签` + `br x17`。
+
+**澄清 2：寄存器只能存一个值**
+
+寄存器不是"变量/容器"，**是一个格子，同一时刻只能放一个 64 位的值**。有新值进来 → **覆盖**，旧值永久消失，**没有记忆、没有历史**。想留住旧值必须自己在覆盖前挪到别处。
+
+**澄清 3：寄存器装不下字符串**
+
+字符串 `"aaa"` 是多个字节，存在内存里；**寄存器里存的是"字符串的地址"**，不是字符串本身：
+
+```
+x0 = [0x2000] ──────► 0x2000: 'a' 'a' 'a' '\0'
+（x0 存的是地址）        （字符串实体在内存）
+```
+
+类比 Android：`String s = "aaa"` 里 `s` 是引用（4/8 字节），真正的字符数据在堆内存，`s` 存的是那个地址。
+
+**澄清 4：`[]` 的含义**
+
+| 写法 | 含义 |
+|------|------|
+| `ldr x0, [0x121]` | **去内存地址 0x121** 处，把那里的内容读进 x0（`[]` = 去这个地址取货） |
+| `mov x0, #0x121` | 把**数值本身**放进 x0（不访问内存） |
+| `ldr x0, =0x121` | 伪指令，等价于把 0x121 这个数放进 x0 |
+
+**`ldr` 与 `str` 方向相反**：`ldr` = 内存 → 寄存器（取）；`str` = 寄存器 → 内存（存）。所以 `ldr pc` 能当跳转（内存→寄存器→正好是写 pc 的方向），`str pc` 不能。
+
+### 六、掌握程度分层
+
+| 层 | 内容 | 程度 |
+|----|------|------|
+| **必须懂** | 字节码/机器码区别、内存分页权限、`ldr`/`str`/`br`、寄存器命名、ART 的 x0 约定、16 字节 = 4 条指令 | 逐条吃透 |
+| **懂原理即可** | CAS 自旋锁（ldrex/strex/dmb）、`IT NE`、PC 相对指令的位掩码检测、I-cache | 知道"干嘛用" |
+| **不用管** | 每条指令的 32 位编码值、各架构编码细节 | 用到再查 |
+
+### 七、补充：指令 = 4 字节的"数字"
+
+arm64 每条指令就是一个 32 位整数。比如 `nop` = `0xd503201f`（arm64.cpp:86）。`IsPCRelatedInst`（arm64.cpp:50-57）就是用**位掩码**判断"这条 32 位数字属于哪类指令"：
+
+```cpp
+INST_CASE(0xff000010, 0x54000000); // b <label>
+INST_CASE(0x7c000000, 0x14000000); // bl <label>
+INST_CASE(0x7e000000, 0x34000000); // cb{n}z Rn, <label>
+INST_CASE(0x7e000000, 0x36000000); // tb{n}z Rt, #<imm>, <label>
+INST_CASE(0x3b000000, 0x18000000); // ldr
+INST_CASE(0x1f000000, 0x10000000); // adr/adrp Rd, <label>
+```
+
+**为什么重要**：这些指令（`b`/`bl`/`ldr`/`adr` 等）的编码里**隐含了"相对当前 PC 的偏移"**，被拷到别处后"当前 PC"变了、行为就错 → 这就是 `CannotBackup` 存在的原因，也是"含 pc 相关指令就不能 inline"的技术根源。
+
+**一句话概括整课**：**字节码给虚拟机、机器码给 CPU；内存按页管权限（改机器码要先改权限）；CPU 靠 4 字节一条的机器码干活，跳转就是改 pc；跳板 = "死的汇编模板 + 活的数据空位"。**
+
+---
+
+## 第十二课：INLINE hook · 第一部分（为什么 + 整体图）
+
+### 一、replacement 的失效场景
+
+replacement 改的是 ArtMethod 的**入口指针字段**，有一个致命失效场景：
+
+> **Android 8.0 以下有 Sharpening 优化**：ART 编译 caller 时，如果能确定 callee 的入口，会**把入口地址硬编码进 caller 的机器码里**，运行时根本不去读 ArtMethod 的入口字段。
+
+含义：你把 add 的入口字段改成跳板，但 caller 早就把原地址 `0x7000` 写死在机器码里，直接跳过去，**修改完全无效**。
+
+**INLINE 的思路**：既然机器码一定被执行，那就**直接改机器码本身**——把 add 机器码开头的几条指令，替换成"跳到我们代码"的指令。
+
+| 模式 | 改什么 | 适用 |
+|------|--------|------|
+| REPLACEMENT | ArtMethod 的**入口指针字段** | Android O+（默认） |
+| INLINE | 目标方法的**机器码本身** | Android O 以下（默认），或主动指定 |
+
+默认模式决策（Pierce.java:179）：`sdkLevel < O ? INLINE_WITHOUT_JIT : REPLACEMENT`。
+
+### 二、和 replacement 的最大区别
+
+| | replacement | inline |
+|---|---|---|
+| 改的对象 | ArtMethod 的**字段**（入口指针） | 目标方法的**机器码** |
+| add.entry_point 字段 | 被改成跳板 | **保持不变**，还是 0x7000 |
+| 备份的是什么 | 一个"**地址**" | 一段"**机器码字节**" |
+| backup 入口指向 | 原机器码 0x7000 | **自己造的 backup trampoline**（0xA000） |
+
+推论：`Pine_hook0` 里 `new_entrypoint = target->GetEntryPointFromCompiledCode()` 在 inline 模式下拿到的还是**原地址 0x7000**（字段根本没动）。
+
+### 三、三段跳板的分工
+
+| 跳板 | 位置 | 作用 |
+|------|------|------|
+| `pine_direct_jump_trampoline` | arm64.S:16-21 | 纯跳转，跳到绝对地址。**被写进目标机器码里** |
+| `pine_bridge_jump_trampoline` | arm64.S:23-44 | **判断 x0**：是目标方法就去 bridge，否则跳回原路 |
+| `pine_backup_trampoline` | arm64.S:68-84 | 装"被覆盖的原指令" + 跳回剩余代码。**成为 backup 入口** |
+
+**① direct_jump（arm64.S:16-21）**
+
+```asm
+FUNCTION(pine_direct_jump_trampoline)
+LDVAR(x17, pine_direct_jump_trampoline_jump_entry)   // 从空位读出"要跳去的地址"
+br x17                                               // 跳过去
+VAR(pine_direct_jump_trampoline_jump_entry)
+.long 0                                              // 空位，运行时填 0xB000
+.long 0
+```
+
+**② bridge_jump（arm64.S:23-44）**
+
+```asm
+FUNCTION(pine_bridge_jump_trampoline)
+LDVAR(x17, ..._target_method)      // ① 读 target（add 的 ArtMethod*）
+cmp x0, x17                        // ② 比较：ART 传进来的 x0 == target 吗？
+bne jump_to_original               // ③ 不等 → 跳去"原路"
+LDVAR(x0, ..._bridge_method)       // ④ 相等 → x0 换成 bridge 的 ArtMethod*
+LDVAR(x17, ..._bridge_entry)       // ⑤ 读 bridge 入口
+br x17                             // ⑥ 跳去 bridge
+jump_to_original:
+LDVAR(x17, ..._call_origin_entry)  // ⑦ 不等 → 跳回 backup trampoline
+br x17
+```
+
+> **`cmp x0` 为什么重要**：x0 是 ART 调用方法时传的"被调方法 ArtMethod*"。正常调 add 时 x0 就是 target，走 bridge。但某些路径下（方法代码共享、别的 ArtMethod 指向同一段机器码），x0 可能不等于 target——这时**不该走注册在 target 上的 bridge**，应跳回原路执行原逻辑。这是安全兜底。
+
+**③ backup（arm64.S:68-84）**
+
+```asm
+FUNCTION(pine_backup_trampoline)
+LDVAR(x0, ..._origin_method)          // ① x0 设为原方法（ART 约定：x0=ArtMethod*）
+VAR(..._override_space)               // ② 空位区：被填上"被覆盖的原指令"
+.long 0
+.long 0
+.long 0
+.long 0
+nop                                   // ③ 反检测用（可能被覆盖）
+nop
+LDVAR(x17, ..._remaining_code_entry)  // ④ 读"剩余代码入口"
+br x17                                // ⑤ 跳回 0x7000+16 继续执行
+VAR(..._origin_method)
+.long 0
+.long 0
+VAR(..._remaining_code_entry)
+.long 0
+.long 0
+```
+
+**backup 跳板语义**：`设好 x0 → 执行被覆盖的原指令 → 跳回原机器码剩余部分继续跑`。**这就是"原方法"能重新执行的原因**。
+
+> 类比：文章被撕掉开头一段，把撕掉的那段**手抄一份**贴到别处，抄件末尾写"抄完请翻回原文第 16 字继续读"。backup trampoline = 手抄件 + 续读指令。
+
+### 四、内存图：跳转链条（以 add 为例）
+
+**约定**：add 机器码在 `0x7000`（共 40 字节，前 16 字节 = 0x7000~0x700F 要被覆盖，剩余 24 字节 = 0x7010~ 不动）；backup 跳板 = `0xA000`；bridge_jump = `0xB000`；bridge 机器码 = `0x8000`；add 的 ArtMethod = `0x5000`；bridge 的 ArtMethod = `0x5100`。
+
+```
+① add 的 ArtMethod（"户口本"，字段没改）
+   ┌──────────────────────────────────┐
+   │ entry_point_from_compiled_code_  │ = 0x7000
+   └──────────────────────────────────┘
+                 │ ART 调 add 时读这个字段，得到 0x7000，跳过去
+                 ▼
+② ┌─ 0x7000 ──────────────────────────────────────────┐
+   │ [direct_jump 跳板，16 字节]                        │
+   │   ldr x17, [槽位: 0xB000]   ← 读出 0xB000          │
+   │   br  x17                   ← 跳到 0xB000 ───────┐ │
+   └─────────────────────────────────────────────────┼─┘
+③ ┌─ 0x7010 ──────────────┐                          │
+   │ add 原机器码剩余部分   │  ← 没被动，待会回来跑     │
+   └───────────────────────┘                          │
+                                                      ▼
+④ ┌─ 0xB000 ─────────────────────────────────────────────────┐
+   │ [bridge_jump 跳板]                                         │
+   │   ldr x17, [槽位: add 的 ArtMethod*]                       │
+   │   cmp x0, x17      ← 比较"当前调的方法"是不是 add           │
+   │   bne 不等分支                                             │
+   │   ── 相等分支 ──                                           │
+   │     ldr x0,  [槽位: bridge 的 ArtMethod*]  ← x0 换成 bridge │
+   │     ldr x17, [槽位: bridge 入口]                            │
+   │     br  x17  ──→ 跳进 bridge 机器码 ──────┐                 │
+   │   ── 不等分支 ──                          │                 │
+   │     br [槽位: 0xA000] ──→ 跳去 backup ──┐ │                 │
+   └─────────────────────────────────────────┼─┼─────────────────┘
+                                             │ ▼
+                                             │ bridge 机器码执行
+                                             │   → handleCall → before 回调
+                                             │   → 回调里调 backup（原方法）
+                                             │        │
+                                             │        ▼
+                                             │  backup 的 ArtMethod.entry_point = 0xA000
+                                             │        │
+                                             │        ▼
+⑤ ┌─ 0xA000 ─────────────────────────────────────────────┼───┐
+   │ [backup 跳板]                                         │   │
+   │   ldr x0, [槽位: add 的 ArtMethod*]  ← 恢复 x0        │   │
+   │   ┌──────────────────────────────┐                    │   │
+   │   │ 执行：从 0x7000 拷来的        │  ← 被覆盖的原指令   │   │
+   │   │      前 16 字节原始机器码      │                    │   │
+   │   └──────────────────────────────┘                    │   │
+   │   ldr x17, [槽位: 0x7010]   ← 读出"剩余代码入口"       │   │
+   │   br  x17  ────────────────────────────────────────────┼──┐│
+   └───────────────────────────────────────────────────────┘  ││
+                        回到 ③ 0x7010，跑完 add 剩余部分 ←────┘│
+                        （不等分支也跳进 0xA000，走同一段备份）←┘
+```
+
+### 五、add(1, 2) 完整走查（回调里把 a 改成 100）
+
+**阶段 0：hook 前**
+
+```
+调 add(1,2)：x0 = 0x5000(add的ArtMethod)，x1 = 1，x2 = 2
+0x7000: [add 前16字节原指令]  0x7010: [add 剩余24字节]
+```
+
+**阶段 1：装 hook 时（先拷贝、后覆盖）**
+
+```
+第1步 Backup()：把 0x7000 前16字节拷到 0xA000
+┌─ 0xA000: backup 跳板 ─────────────────────────┐
+│  [origin_method] = 0x5000                     │
+│  [override_space] = 指令1 指令2 指令3 指令4    │  ← 从 0x7000 拷来
+│  [remaining_code_entry] = 0x7010              │
+└───────────────────────────────────────────────┘
+
+第2步 造 bridge_jump 跳板 0xB000（填 target/bridge/入口/backup 四个空位）
+
+第3步 覆盖 0x7000 前16字节
+┌─ 0x7000 ────────────────────────────────┐
+│  [跳转指令: 跳到 0xB000]  ← 16字节，覆盖 │
+├─ 0x7010 ────────────────────────────────┤
+│  指令5 指令6 ... ret  ← 原地不动         │
+└─────────────────────────────────────────┘
+
+★ add 的 entry_point 字段（0x5000 里）= 0x7000，从头到尾没改
+```
+
+**关键顺序铁律**：`Backup()`（拷贝）在 `WriteDirectJumpTrampolineTo`（覆盖）**之前**执行。
+
+| 步 | 动作 | 0x7000 里是 | 0xA000 里是 |
+|----|------|------------|------------|
+| ② `Backup(...)` | **拷贝**前16字节 → 0xA000 | 还是 add 原指令 | 即将写入副本 |
+| ④ `WriteDirectJumpTrampolineTo(...)` | **覆盖**前16字节 | 变成跳转指令 | 已存着拷来的原指令 |
+
+**如果顺序反了**：先覆盖再拷贝 → 拷到的是"跳转指令" → backup 执行它又跳回 0xB000 → **死循环 + 原逻辑永久丢失**。
+
+**阶段 2：运行时**
+
+```
+② → ③：从调用到 bridge
+业务代码 add(1,2) → 读 add.entry_point = 0x7000 → 跳到 0x7000
+0x7000[跳转指令] → 0xB000
+0xB000(bridge_jump): cmp x0(0x5000) == target(0x5000) → 相等
+  → x0 换成 0x5100(bridge的ArtMethod) → 跳 0x8000(bridge入口)
+
+④：bridge 执行 —— 把参数交给 Java
+0x8000: body = handleCall(0x5000, this, new Object[]{1, 2})
+handleCall: sHookRecords.get(0x5000) → 找到 MethodHook → 构造 CallFrame
+
+⑤：beforeCall 改参数
+beforeCall(callFrame) { callFrame.args[0] = 100; }   // a: 1 → 100
+CallFrame.args = [100, 2]   ← 数组被改（Java 引用传递）
+
+⑥：invokeOriginalMethod → 调 backup
+参数用【改后的】[100, 2] → 读 backup.entry_point = 0xA000 → 跳过去
+
+⑦：backup 跳板 0xA000 执行
+x0 = 0x5000（恢复），x1 = 100，x2 = 2
+执行"从 0x7000 拷来的前16字节"（add 前半段）
+→ ldr x17,[remaining] = 0x7010 → br x17 → 跳到 0x7010
+
+⑧：回原地跑后半段
+0x7010: 指令5 ... ret，此时 x1=100, x2=2 → 100 + 2 = 102 → 返回
+
+⑨：afterCall + 返回
+handleCall: afterCall(callFrame)（可改返回值）→ return 102 → 一路返回给业务代码
+```
+
+**核心结论**：add 的逻辑 = 备份的前半段（在 0xA000 跑）+ 原地剩余段（在 0x7010 跑），**两块合起来才完整**。
+
+### 六、可靠性分析：入口地址会不会变？
+
+**问题**：INLINE hook 的前提是"`entry_point` 持续指向那段被改过的机器码"。如果 JIT 强制重编译，地址就会变，hook 就废了。
+
+**Pine 做的三层防护**：
+
+| 防护 | 位置 | 作用 |
+|------|------|------|
+| ① `kAccCompileDontBother` | `BackupFrom`/`AfterHook`（art_method.cpp:365、458） | 给方法打标记，ART 的 JIT 本身就不编译它 |
+| ② 不主动触发编译 | `Compile()`（art_method.h:73-79） | `INLINE_WITHOUT_JIT` 模式**不调 compile0** |
+| ③ 关 profile saver | `disableProfileSaver`（Pierce.java:966-1005） | 阻止 ART 记录调用 profile → 阻止 **profile-guided AOT** 重编译 |
+
+① 是最硬的，ART 内部的 `IsCompilable()` 逻辑就是检查这个标记。③ 是**实测补上的**，代码注释（Pierce.java:997-1001）是证据：
+
+```java
+//release包在huawei p10 Android 9,有出现过profile-guided AOT
+//release包在云机 小米 14 Pro Android 14,有出现过profile-guided AOT
+//release包在测机 honor magic4 Android 15,有出现过profile-guided AOT
+//在云真机 xiaomi15 android 16 ,有出现过profile-guided AOT
+```
+
+**但无法 100% 保证**。如果真被强制重编译，两种结果：
+
+| 结果 | 表现 | 说明 |
+|------|------|------|
+| **A（更常见）：hook 静默失效，不崩** | before/after 回调莫名不触发 | `entry_point` 改成新编译代码（0x9000），调用直接跑新代码，绕过了我们的跳转 |
+| **B（更窄）：崩溃** | SIGSEGV | 需同时满足"entry 改了 **且** 旧机器码被 JIT code cache GC 回收"，而 backup 跳板里还 `br 0x7010` 指向被回收内存 → 野指针 |
+
+**其他会崩的场景**：
+
+| 场景 | 原因 |
+|------|------|
+| execute-only 内存 | 代码段只可执行不可读，备份时读崩溃（`CannotBackup` 的 SIGSEGV 兜底就是处理这个） |
+| 方法已被内联进 caller | 失效不崩：hook callee 无效（caller 里已有内联副本）；Pine 提供 `decompile`，注释写"应 decompile caller 而非 callee" |
+| 类初始化重置入口 | Q/R 的 `FixupStaticTrampolines`——有 `makeClassesVisiblyInitialized` 防护 |
+
+**这也正是 Android 8.0+ 默认改用 REPLACEMENT 的根本原因**：replacement 只改 ArtMethod 字段，不存在"代码被回收导致野指针"的问题。INLINE 是 Android 8 以下的**无奈之举**。
+
+### 七、安全校验与兜底
+
+**1. `CannotSafeInlineHook`（trampoline_installer.h:105-133）**：两种情况下强制回退 replacement。
+
+| 情况 | 判断依据 | 为什么不行 |
+|------|---------|-----------|
+| 机器码太短 | `code_size < kDirectJumpTrampolineSize`(16) | 放不下跳转指令，覆盖会踩到别的方法 |
+| 含 pc 相关指令 | `CannotBackup`（arm64.cpp:60-80） | 被覆盖的指令里有依赖 pc 位置的指令，拷到别处行为就错 |
+
+**2. `skip_first_few_bytes` 反检测（pine.cpp:271-272）**：开启 `anti_checks` 时，开头 8 字节填 `nop`、跳转指令挪到 +8，规避"读方法开头做完整性检测"的反作弊。代价是覆盖字节从 16 变 24。
+
+**3. SIGSEGV 兜底 `ScopedMemoryAccessProtection`**：部分 Android 10 机型代码段是 execute-only，读写都崩。装一个 SIGSEGV 处理器（scoped_memory_access_protection.cpp:12-37）捕获崩溃 → 当场 `mprotect` 改权限 → 返回让 CPU **重试那条指令** → 成功。
+
+**一句话概括本课**：INLINE hook 就是"**把目标方法机器码开头的十几字节换成跳转指令**"，同时**把被换掉的原指令备份到 backup trampoline**（先备份后覆盖），调原方法时执行备份、再跳回剩余代码；前提是入口地址不变，而这一点只能靠 `kAccCompileDontBother` 等标记**尽量**保证。
+
+---
