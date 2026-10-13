@@ -2824,3 +2824,192 @@ handleCall: afterCall(callFrame)（可改返回值）→ return 102 → 一路�
 **一句话概括本课**：INLINE hook 就是"**把目标方法机器码开头的十几字节换成跳转指令**"，同时**把被换掉的原指令备份到 backup trampoline**（先备份后覆盖），调原方法时执行备份、再跳回剩余代码；前提是入口地址不变，而这一点只能靠 `kAccCompileDontBother` 等标记**尽量**保证。
 
 ---
+
+## 第十三课：INLINE hook · 地址词典 + 完整链路重述（每步注明出处）
+
+> 本课是"重新总结"版：不讲新概念，只把前两课散落的地址、角色、步骤**收成一张干净的表**，并且**每一步都标出它是从哪行代码来的**。
+
+### 一、地址词典：先分清"数据"和"代码"
+
+| 地址 | 到底是什么 | 类别 | 谁生产的 | 出处 |
+|------|-----------|------|---------|------|
+| `0x5000` | `ArtMethod(add)` 结构体 | 📦 数据 | ART 原本就有 | — |
+| `0x5100` | `ArtMethod(bridge)` 结构体 | 📦 数据 | 生成 dex 加载后 ART 建 | `Pierce.java:563-572` |
+| `0x5200` | `ArtMethod(backup)`（假定值） | 📦 数据 | 同上 | `Pierce.java:563-572` |
+| `0x7000` | add 机器码起点，共 40 字节 | ⚙️ 代码 | ART 编译 add 时产出 | — |
+| `0x7000~0x700F` | **被覆盖成"跳板③"**（16 字节） | ⚙️ 代码 | **Pierce 改的** | `trampoline_installer.cpp:249` |
+| `0x7008` | 跳板③ 里的 8 字节数据槽，装 `0xB000` | ⚙️ 代码(含数据) | Pierce 填 | `trampoline_installer.cpp:53-54` |
+| `0x7010` | add 剩余 24 字节原指令 | ⚙️ 代码 | ART（未被动过） | — |
+| `0x8000` | **bridge 的机器码** | ⚙️ 代码 | **ART 的 JIT** | `pine.cpp:241` |
+| `0xA000` | **跳板①** backup trampoline，52 字节 | ⚙️ 代码 | Pierce 造 | `arm64.S:70-86` |
+| `0xB000` | **跳板②** bridge_jump trampoline，64 字节 | ⚙️ 代码 | Pierce 造 | `arm64.S:25-46` |
+
+**三条铁律（本课最该记的）**：
+
+1. **只有 `0x7000` 的头 16 字节是被【改】的**——`trampoline_installer.cpp:249`。
+2. `0xA000` / `0xB000` / `0x8000` 全是【新造】的，原本不存在。
+3. **`ArtMethod(add).entry_point` 一直是 `0x7000`，一个字都没动**——这是 INLINE 与 REPLACEMENT 的根本区别（REPLACEMENT 改的是这个指针，见第十课）。
+
+### 二、"跳板"的定义
+
+**跳板（trampoline）= 只管跳转、不管业务的汇编小段**，像楼道里的指路牌：自己不办公，只告诉执行流往哪走，顺手改一两个寄存器。
+
+| 编号 | 名字 | 住址 | 一句话职责 | 出处 |
+|------|------|------|-----------|------|
+| ③ | `direct_jump` | `0x7000` | 拦住 add 的原机器码，往外跳 | `arm64.S:18-23` |
+| ② | `bridge_jump` | `0xB000` | 验明身份（比 x0），是→bridge，否→放行 | `arm64.S:25-46` |
+| ① | `backup` | `0xA000` | 换回 add 身份，补跑被毁的头 4 条指令 | `arm64.S:70-86` |
+
+### 三、跳板② 逐条（64 字节；偏移全部来自 `arm64.S:25-46`）
+
+| 偏移 | 汇编 | 作用 | 数据槽由谁填 |
+|------|------|------|-------------|
+| `+0x00` | `ldr x17, [0xB020]` | x17 ← `0x5000`（靶子的 ArtMethod） | — |
+| `+0x04` | `cmp x0, x17` | 比 x0 是否等于靶子 | — |
+| `+0x08` | `bne +0x18` | 不等 → `jump_to_original` | — |
+| `+0x0C` | `ldr x0, [0xB028]` | x0 ← `0x5100`（★换成 bridge 的身份） | — |
+| `+0x10` | `ldr x17, [0xB030]` | x17 ← `0x8000` | — |
+| `+0x14` | `br x17` | → bridge 机器码 | — |
+| `+0x18` | `ldr x17, [0xB038]` | x17 ← `0xA000` | — |
+| `+0x1C` | `br x17` | → 跳板①（放行原逻辑） | — |
+| `+0x20` | 槽 = `0x5000` target_method | 靶子是谁 | `trampoline_installer.cpp:75-77` |
+| `+0x28` | 槽 = `0x5100` bridge_method | 换成的身份 | `:79-81` |
+| `+0x30` | 槽 = `0x8000` bridge_entry | bridge 机器码入口 | `:83-84` |
+| `+0x38` | 槽 = `0xA000` call_origin_entry | 放行时去哪 | `:86-88` |
+
+**为什么要比 x0**：仓库注释（`arm64.S:26-27`）只说"比较 x0（通常是被调用方法的 ArtMethod\*）与 target"，**没有写设计动机**。机制上的推论：同一段编译机器码可能被多个 ArtMethod 指向，若 x0 ≠ target 就说明"不是以 add 的身份过来的"，此时绝不能触发 hook，必须放行原逻辑。**（此条为推论，非仓库文档结论。）**
+
+### 四、完整链路：`add(1,2)` → 回调把 a 改成 3 → 返回 5
+
+| 步 | 位置 | 谁在动 | 具体动作 | 出处 |
+|---|------|-------|---------|------|
+| 0 | caller | ART | 按约定备寄存器：x0=`0x5000`、x1=1、x2=2，x30=返回地址 | ART 调用约定 |
+| 1 | `0x7000` 跳板③ | 汇编 | `ldr x17,[0x7008]` → x17=`0xB000`；`br x17` | `arm64.S:19-20`；写入见 `trampoline_installer.cpp:51-56` |
+| 2 | `0xB000` 跳板② | 汇编 | cmp x0 相等 → x0 ← `0x5100`；跳 `0x8000` | `arm64.S:26-31` |
+| 3 | `0x8000` bridge | JIT 码 | 把 1、2 装箱成 `Object[]{Integer(1),Integer(2)}` | `DexBuilderUtil.cpp:136-150` |
+| 4 | `0x8000` bridge | JIT 码 | `invoke-static` 调 `HandleCallWrapClass.handleCall(0x5000,null,args)` | `DexBuilderUtil.cpp:158-168` |
+| 5 | Java | Pierce | 按号码查表：`sHookRecords.get(0x5000)` | `Pierce.java:1053` |
+| 6 | Java | **主人回调** | `beforeCall` 里 `args[0] = 3` ★**参数修改在这一步** | `Pierce.java:1080-1082` |
+| 7 | Java | Pierce | `invokeOriginalMethod()` → `callBackupMethod` | `Pierce.java:1099` → `:794` |
+| 8 | Java | Pierce | `backup.invoke(null, args)` ★**反射调用** | `Pierce.java:800` |
+| 9 | ART | ART | 读 `ArtMethod(backup).entry` = `0xA000` → pc=`0xA000` | entry 由 `art_method.cpp:424` 设定 |
+| 10 | `0xA000` 跳板① | 汇编 | `ldr x0,[0xA024]` → x0 恢复 `0x5000`；跑副本 #1~#4 | `arm64.S:71-76` |
+| 11 | `0xA000` → `0x7010` | 汇编 | `br [remaining_code_entry]` = `0x7010` | `arm64.S:79-80`；值由 `trampoline_installer.cpp:157-162` 填 |
+| 12 | `0x7010` | 原码 | 原指令 #5~#10 → `add w0,w1,w2` = **3+2 = 5** → `ret`（x30 全程未变） | — |
+| 13 | Java | Pierce | `afterCall` 收到 result=5 → bridge 拆箱 → caller 拿到 5 | `Pierce.java:1108-1112` |
+
+**★ 参数修改（步 6）在 Java 层，不在任何跳板/汇编里**。汇编做不到"按原方法类型动态装箱 N 个参数"，只能交给 Java。
+
+**★ 步 9 的 `0xA000` 不是被任何汇编 `br` 到的，而是被 Java 反射"调"到的**——`backup.invoke` 让 ART 去读 backup 的 entry，读到什么就跳什么。
+
+### 五、bridge 四问
+
+**Q1：bridge 是谁造的？**（全部发生在 `Pierce.hook()` 那一刻）
+
+| 步 | 谁 | 干什么 | 出处 |
+|---|----|-------|------|
+| 1 | Java | `hook()` → `hookNewMethod` | `Pierce.java:415` |
+| 2 | Java | → `genereateDexAndLoad` | `Pierce.java:470` |
+| 3 | Java | → 调 native `generateDex(...)`，传类名/方法名/shorty | `Pierce.java:526` |
+| 4 | **C++** | **slicer 从零拼出一个 dex**：新类 + `artTargetMethod` 静态字段 + `xxxBackup` 占位 + `xxx`(bridge) 包装方法 | `DexBuilderUtil.cpp:62-186` |
+| 5 | C++ | 把 dex 写到磁盘 | `DexBuilderUtil.cpp:188-` |
+| 6 | Java | `DexClassLoader` 加载 → 反射取出 bridge/backup 两个 Method 存进 hookRecord | `Pierce.java:563`、`:572`、`:583-625` |
+| 7 | **ART** | **JIT 把 bridge 编成机器码 → `0x8000`** | 触发点 `pine.cpp:241` |
+
+**★ 没有任何一步"把原方法变成 bridge"**——原方法机器码一直在 `0x7000`，bridge 是凭空虚造的新方法。**bridge 里一行 add 的原逻辑都没有。**
+
+**Q2：bridge 怎么调 handleCall？**
+
+| 步 | 做什么 | 出处 |
+|---|-------|------|
+| 1 | C++ 往 dex 的 `method_ids` 表登记一条引用：`GetOrDeclareMethod(类, "handleCall", 原型)` | `DexBuilderUtil.cpp:152-156` → `dex_builder.cc:843-849` |
+| 2 | 往 bridge 的指令流里插一条 `invoke-static` 字节码 | `DexBuilderUtil.cpp:163-164` → `dex_builder.h:414-419` (`Op::kInvokeStatic`) |
+| 3 | ART 加载时按（类,名,原型）解析成 `ArtMethod*`（DexCache 缓存） | 依赖 `DexClassLoader` 的**父加载器** = `Pierce.class.getClassLoader()`，`Pierce.java:562` |
+| 4 | JIT 把 `invoke-static` 编成一条 `bl` → handleCall 的编译入口 | — |
+
+**关键**：这不是"运行时按字符串找方法"，而是 dex 里一条**正规的方法引用**，和 javac 编译出来的完全同类。父加载器设错 → bridge 一调就 `NoClassDefFoundError`。
+
+**Q3：回调是怎么挂到 bridge 上的？**（★ bridge 完全不知道回调的存在）
+
+```
+【存】用户写回调 → Pierce.hook(method, callback)                Pierce.java:356
+        → callback 塞进 HookRecord.callbacks（HashSet）          Pierce.java:1247
+        → HookRecord 按 artMethod 号码存进全局表                 Pierce.java:397 / 670
+          sHookRecords.put(0x5000, hookRecord)
+
+【取】运行时 bridge 调 handleCall(0x5000, ...)                   Pierce.java:1051
+        → 按号码查表 sHookRecords.get(0x5000)                    Pierce.java:1053
+        → 取出所有回调 hookRecord.getCallbacks()                 Pierce.java:1075
+        → 逐个跑 callback.beforeCall / afterCall                 Pierce.java:1082 / 1112
+```
+
+**bridge 是"通用模具"，回调是"插件"，二者靠【号码 0x5000 + 查表】关联。** 回调在 `Pierce.hook()` 时就已经存好了，**远早于** `0x8000` 被造出来。
+
+（补充：生成类名里确实带了回调类名 `Pierce.java:511-513`，但那只用于**文件/类名唯一性**，功能上不参与分发。）
+
+**Q4：为什么 bridge 的机器码是 `0x8000`（那个值从哪来）？**
+
+先分层：`0x8000` **是举例用的约定值**，真实值每次运行都不同，原因有二——① **ASLR**：进程地址布局每次启动都随机；② **JIT 分配**：ART 自己维护一块可执行内存（JIT code cache），地址是当时现挑的。
+
+真实值的来源链条：
+
+| 步 | 内容 | 出处 |
+|---|------|------|
+| 1 | 强制提前编译 bridge | `pine.cpp:238-241` `bridge->Compile(thread)` |
+| 2 | `Compile` 内部四道判断 | `art_method.h:73-79` |
+| 3 | → `Jit::CompileMethod` | `jit.cpp:143-170` |
+| 4 | → ART `jit_compile_method(...)` 在 JIT code cache 分配机器码，地址写回 `ArtMethod(bridge)` | `jit.cpp:159-162` |
+| 5 | **这个地址 = 真实版的 `0x8000`** | — |
+
+**★ 为什么必须"提前"编**（`pine.cpp:239-240` 注释原文）：bridge 的入口会被**一次性硬编码**进跳板② 的数据槽——`trampoline_installer.cpp:84`：
+
+```cpp
+*bridge_entry_out = bridge->GetEntryPointFromCompiledCode();   // ★ 此刻取到就烧死
+```
+
+若先装跳板后编译，JIT 之后换了入口，槽里那个旧值就永久失效 → 调用跳进野地址。**顺序被锁死：先 `Compile`（`pine.cpp:241`）→ 后装跳板。**
+
+**兜底**：若 `Compile` 返回 false（Android R 明确不支持 `jit.cpp:144-147`；或 `INLINE_WITHOUT_JIT` 模式禁 JIT），`GetEntryPointFromCompiledCode()` 仍是 `art_quick_to_interpreter_bridge`，跳板槽里烧的就是它 → bridge 走解释器执行，**慢但功能正常**。`IsCompiled()` 就是靠这个判断的（`art_method.h:68-71`）。
+
+### 六、几个容易搞混的点（速答）
+
+| 疑问 | 答案 |
+|------|------|
+| 反射调原方法 + pc 指到 `0xA000`，是我们做的吗？ | **一半一半**：发起调用（`Pierce.java:800`）和把 entry 设成 `0xA000`（`art_method.cpp:424`）**是我们做的**；真正按 entry 把 pc 指过去是 **ART 反射机制做的** |
+| backup 的机器码是什么？ | **它是 `return 0;`**（`DexBuilderUtil.cpp:99-112`），但**永远不会执行**——entry 被我们改成 `0xA000` 了，那段是**死代码** |
+| 跳板① 跑 16 字节副本后为什么要 `br 0x7010` 而不是 `ret`？ | 要把"被拆成两半的原指令"重新接成一条龙；`ret` 会直接返回调用者，剩余 24 字节原指令就白丢了 |
+| 为什么会死循环？ | 若跳板① 跳回 `0x7000`（已是跳板③）→ 又跳 `0xB000` → 又进 hook → 又调 backup → ∞。所以跳板① **必须跳到 `0x7010`** |
+| 为什么全用 `br` 不用 `blr`？ | `bl`/`blr` 会覆盖 x30（返回地址）。这条链只应有一次"调用"（caller 调 add 那次），后面全是**尾调用**接力，用 `blr` 会让 bridge 的 `ret` 跳回跳板中间 → 栈错乱 |
+| 两次刷 x0（`0x5100`、`0x5000`）为什么要这么做？ | ART 约定 x0 = "当前执行方法的 ArtMethod\*"，GC/异常/栈回溯都靠它。进 bridge 前换成 bridge 的，跑 add 原码前换回 add 的 |
+
+### 七、本课记忆锚点
+
+```
+地址词典（三分类）：
+  📦 数据：0x5000/0x5100/0x5200 —— 三个 ArtMethod 结构体
+  ⚙️ 原码：0x7000~0x7027（add 机器码，头 16 字节被改）、0x7010 后半段（未动）
+  ⚙️ 新码：0x8000（bridge JIT 码）、0xA000/0xB000（新造跳板）
+
+唯一【被改】：0x7000 的头 16 字节（trampoline_installer.cpp:249）
+INLINE 特征：ArtMethod(add).entry_point 一直是 0x7000，没动过
+
+三跳板分工：
+  ③ 0x7000 → 往外撵
+  ② 0xB000 → 比 x0：是→0x8000；否→0xA000
+  ① 0xA000 → x0 换回 0x5000 + 补跑头 4 条 + br 0x7010
+
+参数修改的位置：Java 的 beforeCall（Pierce.java:1082），不在汇编里
+
+bridge 的四个事实：
+  本体 = 装箱 + invoke-static handleCall + 拆箱，零原逻辑
+  造法 = C++ slicer 拼 dex（DexBuilderUtil.cpp:62-186）→ DexClassLoader 加载
+  调法 = dex 里一条 invoke-static → ART 解析按（类,名,原型）→ JIT 编成 bl
+  回调 = 不在 bridge 里，靠 0x5000 查 sHookRecords（Pierce.java:1053）
+
+0x8000 的来源：
+  bridge->Compile(thread)  pine.cpp:241 → Jit::CompileMethod jit.cpp:143-170
+  → ART 在 JIT code cache 分配机器码
+  必须提前编：值要一次性烧死进跳板② 数据槽（trampoline_installer.cpp:84）
+```
+
+---
