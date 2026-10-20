@@ -3013,3 +3013,256 @@ bridge 的四个事实：
 ```
 
 ---
+
+## 第十四课：INLINE hook · 整体骨架（按代码调用链顺序）
+
+> 本课不引入新概念，只把一次 INLINE hook 从进 native 到返回的**完整骨架**按代码顺序串一遍。
+> 行号按当前工作区源码核对（`pine.cpp` / `trampoline_installer.cpp` 有本地改动，与早期笔记行号不同）。
+
+### 一、骨架总览：一次 hook 的六段
+
+全部发生在 `Pine_hook0` 一个函数体内（`pine.cpp:203-330`）：
+
+| 段 | 位置 | 做什么 | 产物 |
+|---|---|---|---|
+| 0 | `pine.cpp:214-235` | 取指针、取参数、打日志 | `target` / `bridge` / `backup` 三个 `ArtMethod*` |
+| 1 | `pine.cpp:238-246` | 先 JIT 编译 bridge | bridge 入口地址被**定死** |
+| 2 | `pine.cpp:249-272` | 三道判断，决定 inline 还是降级 | 最终的 `is_inline_hook` / `skip_first_few_bytes` |
+| 3 | `pine.cpp:278-286` | 挂起所有线程 + 装跳板 | `call_origin`（原始入口） |
+| 4 | `pine.cpp:294-299` | 备份原方法逻辑 + 改目标入口 | `new_entrypoint` |
+| 5 | `pine.cpp:315-329` | 写回 Java 层、返回 backup | `javaBackup` 或抛异常 |
+
+一次 INLINE hook 的本质，就是这六段的顺序执行。
+
+### 二、第 0 段：入口与取值（`pine.cpp:203-235`）
+
+```cpp
+jobject Pine_hook0(JNIEnv *env, jclass,
+                   jlong threadAddress, jclass declaring, jobject hookRecord,
+                   jobject javaTarget, jobject javaBridge, jobject javaBackup,
+                   jboolean isInlineHook, jboolean isJni, jboolean isProxy) {
+```
+
+`pine.cpp:203-213`。前两个参数 `JNIEnv* env` 和 `jclass` 是 JNI 静态 native 方法的**固定前两位**，后面才是 Java 传的真参数。Java 侧调用点在 `Pierce.java:474-482`。
+
+`pine.cpp:219-221` 把三个 `jobject` 翻译成 native 指针：
+
+```cpp
+auto target = art::ArtMethod::FromReflectedMethod(env, javaTarget);
+auto bridge = art::ArtMethod::FromReflectedMethod(env, javaBridge);
+auto backup = art::ArtMethod::FromReflectedMethod(env, javaBackup);
+```
+
+| 指针 | 是谁 | 角色 |
+|---|---|---|
+| `target` | 被 hook 的原方法（add） | 被改的对象 |
+| `bridge` | 生成的中间方法 | 新入口，负责转调 `handleCall` |
+| `backup` | 生成的方法 | 存原方法逻辑，供 after 回调调原方法 |
+
+### 三、第 1 段：先编译 bridge（`pine.cpp:238-246`）
+
+```cpp
+if (PineConfig::jit_compilation_allowed && PineConfig::auto_compile_bridge) {
+    bridge->Compile(thread);
+}
+```
+
+注释 `pine.cpp:239-240` 写明了原因：**bridge 的入口地址会被硬编码进跳板，之后再优化就没用了**。跳板里存的是死地址，bridge 后续被 JIT 重新编译换了入口，跳板不会知道。所以必须在装跳板前先把 bridge 编译到最终形态。
+
+调用链：`art_method.h:73-79` → `Jit::CompileMethod`（`jit.cpp:143-170`）→ ART 的 `jit_compile_method`。这就是 0x8000 的真实来源。
+
+编译失败或不满足条件时（Android R+ 下 `jit.cpp:144-147` 直接返回 false），bridge 入口会落到 `art_quick_to_interpreter_bridge`（解释器），功能正常但性能差。
+
+### 四、第 2 段：三道判断（`pine.cpp:249-272`）
+
+拿到安装器单例（`pine.cpp:249`，`GetDefault` 见 `trampoline_installer.h:26-28`）后连做三次判断。
+
+**判断一：架构或方法状态不支持 inline → 降级（`pine.cpp:252-259`）**
+
+```cpp
+if (is_inline_hook && (trampoline_installer->IsReplacementOnly() || !target->IsCompiled())) {
+    is_inline_hook = false;
+}
+```
+
+- `IsReplacementOnly()`（`trampoline_installer.h:82-84`）：该架构只会改指针，不改进机器码。
+- `!target->IsCompiled()`：目标方法**没被编译成机器码**（还在解释执行）。INLINE 的前提是有一段机器码可覆盖。
+
+**判断二：机器码太短或含 PC 相关指令 → 降级（`pine.cpp:262-267`）**
+
+`CannotSafeInlineHook(ArtMethod*)`（`trampoline_installer.h:105-133`）查两件事：
+
+1. **长度**（`:86-88`）：`size < kDirectJumpTrampolineSize`。arm64 下 `kDirectJumpTrampolineSize = 16`（`arm64.cpp:47`）。
+2. **PC 相关指令**（`:121` → `CannotBackup`）：`arm64.cpp:50-80` 逐条 4 字节扫描，命中即返回 true：
+   - `b <label>`（:51）、`bl <label>`（:52）
+   - `cb{n}z`（:53）、`tb{n}z`（:54）
+   - `ldr` 字面量加载（:55）、`adr/adrp`（:56）
+
+**为什么 PC 相关指令不能备份**：它们的编码里含"相对当前 PC 的偏移量"。搬到 backup 跳板（另一个地址）后偏移量仍按老地址算，跳转目标就全错了。
+
+**判断三：是否跳过开头几个字节（`pine.cpp:271-272`）**
+
+```cpp
+bool skip_first_few_bytes = PineConfig::anti_checks
+                            && is_inline_hook && trampoline_installer->CanSkipFirstFewBytes(target);
+```
+
+不是降级闸门，而是**隐蔽性开关**。开启后跳板不覆盖目标最开头字节，而是前面填 nop、跳转往后挪，让函数头的原始指令原封不动，规避"检查函数头是否被改"的完整性检测。`CanSkipFirstFewBytes`（`trampoline_installer.h:141-157`）就是把长度和 PC 指令再查一遍，只不过要求的大小变成 `kDirectJumpTrampolineSize + kSkipBytes`。
+
+> 三道判断的共同模式：前两道是"能不能做"的安全闸门，不满足就**降级到 replacement**；第三道是"要不要藏得更深"，只影响覆盖位置。
+
+### 五、第 3 段：挂起全线程 + 装跳板（`pine.cpp:278-286`）
+
+```cpp
+{
+    ScopedSuspendVM suspend_vm(thread);
+
+    void *call_origin = is_inline_hook
+                        ? trampoline_installer->InstallInlineTrampoline(target, bridge, skip_first_few_bytes)
+                        : trampoline_installer->InstallReplacementTrampoline(target, bridge);
+```
+
+#### 🖥️ 穿插知识点【操作系统】Stop-The-World 与 RAII
+
+**为什么必须挂起所有线程**：`ArtMethod` 是所有线程共享的全局结构。假设线程 A 正在执行 `add`，同时 hook 线程开始改 `add` 的机器码。改到一半（16 字节只写了 8 字节），线程 A 恰好取指令取到中间——看到"一半新跳转 + 一半旧指令"的垃圾组合，CPU 会跳到随机地址直接崩溃。
+
+ART 自己的 GC 也面对同样问题，所以它有现成机制：**挂起所有线程，让它们在安全点停下，等操作完成再恢复**，业界叫 Stop-The-World（STW）。
+
+**`ScopedSuspendVM` 怎么用**（`android.h:162-174`）：
+
+```cpp
+class ScopedSuspendVM {
+public:
+    ScopedSuspendVM(void* self) { Android::SuspendVM(this, self, "pierce hook method"); }
+    ~ScopedSuspendVM() { Android::ResumeVM(this); }
+};
+```
+
+这是 **RAII**（Resource Acquisition Is Initialization）：构造函数挂起，析构函数恢复。C++ 保证对象离开作用域时析构一定被调用，**即使中间抛异常或提前 return**。
+
+所以 `pine.cpp:281` 声明后，第 3、4 段全部跑在"其他线程冻结"状态下；执行到 `:313` 大括号闭合时恢复。
+
+**为什么 `pine.cpp:278-313` 要加大括号**：用它界定挂起的时间窗口。挂起期间其他线程停摆，窗口必须尽量短——只放"改机器码"和"改入口"这两件必须原子完成的事，日志、参数校验全部放在窗口外。
+
+**恢复时机**：`:313` 的闭合括号在错误处理之前结束，说明**先恢复线程、再抛异常**，避免带着挂起状态抛 Java 异常造成死锁。
+
+### 六、`InstallInlineTrampoline` 五步（`trampoline_installer.cpp:215-285`）
+
+| 步 | 位置 | 动作 | 说明 |
+|---|---|---|---|
+| 1 | `:219-224` | 取目标机器码地址 + 改成可写 | `GetCompiledCodeAddr()` 拿 0x7000；`Memory::Unprotect` 把代码页从"只读可执行"改成可写 |
+| 2 | `:231-234` | 算备份多少字节 | `kDirectJumpTrampolineSize`（16）；开 skip 时 `+= kSkipBytes` |
+| 3 | `:236` | **造 backup 跳板** | `Backup(target, backup_size)` |
+| 4 | `:239` | 造 bridge_jump 跳板 | `CreateBridgeJumpTrampoline(target, bridge, back_up_trampoline)` |
+| 5 | `:242-251` | **把跳转写进目标机器码开头** | 开 skip 时先填 nop 再写跳转 |
+| 返 | `:284` | 返回 backup 跳板地址 | 就是 `call_origin` |
+
+**第 3 步必须先于第 5 步**：`Backup` 内部（`:154-155`）要把目标开头的原始字节拷走：
+
+```cpp
+void* target_addr = target->GetEntryPointFromCompiledCode();
+memcpy(AS_VOID_PTR(addr + kBackupTrampolineOverrideSpaceOffset), target_addr, size);
+```
+
+而第 5 步会把这些字节覆盖掉。顺序反了，备份到的就是已经被改掉的跳转指令，backup 一执行就自己跳自己，死循环。
+
+`Backup` 的剩余代码判断（`:157-162`）：目标机器码总长**大于**备份长度时，把 `target_addr + size`（即 0x7010）写进 backup 跳板的 remaining 槽；恰好等长就不填。
+
+**第 4 步的四个槽位**（`CreateBridgeJumpTrampoline`，`:58-93`）：
+
+| 槽位 | 写入内容 | 代码 |
+|---|---|---|
+| target | `target` | `:75-77` |
+| bridge_method | `bridge` | `:79-81` |
+| bridge_entry | `bridge->GetEntryPointFromCompiledCode()` | `:83-84` |
+| call_origin_entry | `origin_code_entry` 实参 = `back_up_trampoline` | `:86-88` |
+
+第四槽存的是 **backup 跳板地址**（`:239` 传入），这一步把三块新造的代码串成了一条链。
+
+### 七、第 4 段：备份原方法 + 改目标入口（`pine.cpp:294-299`）
+
+```cpp
+if (LIKELY(call_origin)) {
+    backup->BackupFrom(target, call_origin, is_inline_hook, is_native, is_proxy);
+    target->AfterHook(is_inline_hook, is_native, is_proxy);
+    new_entrypoint = target->GetEntryPointFromCompiledCode();
+}
+```
+
+**`BackupFrom`（`art_method.cpp:346-446`）—— 管 backup 方法**
+
+1. 把 target 的整个 `ArtMethod` 结构复制到 backup（`:355`）。优先调 ART 的 `copy_from`（`:357` 裸 `memcpy` 是兜底）。注释 `:344-345` 说明原因：`copy_from` 会修正 GC 根、JIT 入口、Nterp 入口，裸 `memcpy` 会漏掉导致随机崩溃。
+2. 把 backup 的编译入口设为 `call_origin`（`:424` `SetEntryPointFromCompiledCode(entry)`）——这就是"反射调 backup 会到达 0xA000"的那条线。
+
+`:360-375` 改 `access_flags`：清 public/protected、加 private、清 constructor，让 ART 把它当"直接方法"调用。
+
+**`AfterHook`（`art_method.cpp:448-519`）—— 管 target 方法**
+
+改 target 的 `access_flags`，防止 JIT/AOT 把 hook 优化掉：
+
+- `:458` 设 `kAccCompileDontBother` —— 告诉 ART 别再编译，否则 JIT 重新编译会覆盖我们写的跳转。
+- `:480` 清 `kFastInterpreterToInterpreterInvoke` —— 清掉快速解释器缓存标记。
+- `:499` `SetEntryPointFromInterpreter(...)` —— 解释器入口也接管。
+
+`AfterHook` 在 INLINE 模式下**没有**改编译入口指针——INLINE 改的是那个地址**里面的字节**。对比 `trampoline_installer.cpp:185`：REPLACEMENT 在那里 `SetEntryPointFromCompiledCode(method_jump_trampoline)` 真改指针。
+
+### 八、第 5 段：写回与返回（`pine.cpp:315-329`）
+
+**成功**（`:315-325`）：把 `new_entrypoint` 写进 `HookRecord.trampoline`，然后**返回 `javaBackup`**。
+
+返回 backup 而不是 target：after 回调和 `invokeOriginalMethod` 要调的是原逻辑，而 backup 的入口已经指向备份好的原逻辑，target 已被改过。
+
+**失败**（`:300-312`、`:326-329`）：`error_msg` 在挂起窗口内拼好，窗口关闭后抛 Java 异常。`:308-309` 判断 `errno == EACCES || errno == EPERM` 时附加安全策略提示，并抛 `SecurityException` 而非 `RuntimeException`。
+
+### 九、产物对照表
+
+| 产物/改动 | 位置 | 来源 | 作用 |
+|---|---|---|---|
+| 目标机器码开头 16 字节 | 0x7000 起 | `trampoline_installer.cpp:242-251` | 改成跳转到 bridge_jump 跳板 |
+| bridge_jump 跳板 | 堆上（0xB000） | `:58-93` | 比 x0，决定走 bridge 还是跳回原路 |
+| backup 跳板 | 堆上（0xA000） | `:141-166` | 还原 x0、执行被拷走的 16 字节、跳到 0x7010 |
+| `backup.entry_point` | ArtMethod 内 | `art_method.cpp:424` | 指向 backup 跳板 |
+| `target.access_flags` | ArtMethod 内 | `art_method.cpp:493` | 禁 JIT/禁内联，保住 hook |
+| `HookRecord.trampoline` | Java 对象字段 | `pine.cpp:316` | 记录给 Java 层 |
+
+`target.entry_point` **没变**，始终指向 0x7000。
+
+### 十、本课记忆锚点
+
+```
+【INLINE 整体骨架】
+
+入口 Pine_hook0 (pine.cpp:203-330)，六段：
+  0 取值      :214-235  javaTarget→target, javaBridge→bridge, javaBackup→backup
+  1 编译bridge :238-246  bridge->Compile(thread)
+                         必须在装跳板前做，入口要硬编码进跳板
+  2 三道判断   :249-272
+      判断一 :252-259  IsReplacementOnly() || !IsCompiled()  →降级
+      判断二 :262-267  CannotSafeInlineHook(target)          →降级
+                        (长度<16 或开头含 PC 相关指令)
+      判断三 :271-272  CanSkipFirstFewBytes → skip_first_few_bytes (只为隐蔽)
+  3 挂起+装跳板 :278-286
+      ScopedSuspendVM (android.h:162-174) = RAII 的 STW
+        构造挂起 / 析构恢复 / 大括号界定窗口 / 窗口内不放日志校验
+      InstallInlineTrampoline 五步 (trampoline_installer.cpp:215-285)
+        1 :219-224 取地址 + 改可写
+        2 :231-234 算 backup_size
+        3 :236     Backup 造备份跳板   ← 必须先于第5步(先拷贝后覆盖)
+        4 :239     CreateBridgeJumpTrampoline(:58-93) 四槽位
+        5 :242-251 把跳转写进目标开头
+        返回 :284  back_up_trampoline → call_origin
+  4 备份+改入口 :294-299
+      BackupFrom (art_method.cpp:346-446)
+        :355 copy_from 优先(修正 GC根/JIT/Nterp)，裸 memcpy 兜底
+        :424 SetEntryPointFromCompiledCode(call_origin) ← backup 指向 0xA000
+      AfterHook (art_method.cpp:448-519) 只改 access_flags
+        :458 kAccCompileDontBother(禁JIT)  :480 清快速解释器标记
+        INLINE 不动 entry_point 指针(REPLACEMENT 才动，见 :185)
+  5 写回+返回   :315-329
+      成功: HookRecord.trampoline = new_entrypoint; return javaBackup
+      失败: errno==EACCES/EPERM → SecurityException，否则 RuntimeException
+
+产物：0x7000 改动 / bridge_jump 跳板 / backup 跳板 / backup.entry / target.flags
+```
+
+---
